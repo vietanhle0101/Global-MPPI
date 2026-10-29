@@ -43,6 +43,35 @@ parser.add_argument(
     help="KSOS solver used by GlobalMPPI (default: newton-rs)",
 )
 parser.add_argument(
+    "--ksos-sampling",
+    choices=["uniform", "sobol", "flow"],
+    default="uniform",
+    help="Candidate-knot sampling distribution used by GlobalMPPI's KSOS "
+    "pass (default: uniform; unchanged behavior). 'flow' is not implemented "
+    "yet.",
+)
+parser.add_argument(
+    "--seeds",
+    type=int,
+    nargs="+",
+    default=list(range(6)),
+    help="Seeds to run, one episode per seed (default: 0 1 2 3 4 5)",
+)
+parser.add_argument(
+    "--cycles",
+    type=int,
+    default=100,
+    help="Max control cycles per seed (default: 100)",
+)
+parser.add_argument(
+    "--log-l2s",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Log raw KSOS candidate data (knots, costs, box bounds, ...) per "
+    "cycle to data/l2s/raw/ for offline flow-sampler training. Off by "
+    "default; GlobalMPPI only.",
+)
+parser.add_argument(
     "--wandb-project",
     default="global-mppi",
     help="W&B project name (default: global-mppi)",
@@ -155,11 +184,11 @@ elif args.algorithm == "globalmppi":
         num_knots=6,
         iterations=5,
         ksos_solver=args.ksos_solver,
+        ksos_sampling=args.ksos_sampling,
     )
 
 # Run the interactive simulation
-start_seed = 0
-for trial_idx in range(start_seed, 6):
+for trial_idx in args.seeds:
     # Define the model used for simulation
     mj_model = task.mj_model
     mj_model.opt.timestep = 0.001
@@ -179,10 +208,11 @@ for trial_idx in range(start_seed, 6):
         record_video=False,
         max_traces=5,
         current_seed=trial_idx,
-        max_cycles=100,
+        max_cycles=args.cycles,
         current_task="pushT_globalmppi",
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         headless=args.headless,
+        log_l2s=args.log_l2s,
     )

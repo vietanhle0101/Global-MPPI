@@ -136,6 +136,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     wandb_project: str = "global-mppi",
     wandb_entity: str = None,
     headless: bool = False,
+    log_l2s: bool = False,
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -248,6 +249,20 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         RUN_TIMESTAMP,
     )
     os.makedirs(run_log_dir, exist_ok=True)
+
+    # Opt-in L2S (learned-sampler) raw data directory: one .npz per
+    # (seed, cycle) with every KSOS pass of that cycle, used offline to train
+    # the flow sampler. Off by default; does not affect the RNG stream.
+    if log_l2s:
+        l2s_log_dir = os.path.join(
+            repo_root,
+            "data",
+            "l2s",
+            "raw",
+            f"{current_task}_{controller.ctrl_name}",
+            RUN_TIMESTAMP,
+        )
+        os.makedirs(l2s_log_dir, exist_ok=True)
 
     # Initialize video recording if enabled
     recorder = None
@@ -373,10 +388,16 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 os.makedirs(log_dir, exist_ok=True)
                 timing_file = os.path.join(log_dir, "globalmppi_timing.txt")
                 
+                if log_l2s:
+                    l2s_knots, l2s_lse_cost, l2s_cost_summed = [], [], []
+                    l2s_lb, l2s_ub, l2s_elite_indices = [], [], []
+                    l2s_sigma, l2s_ksos_mean, l2s_ksos_result_cost = [], [], []
+
                 if cycle_count % 1 == 0:          # 5 for pushT with ksos
                     total_ksos_rollout_time = 0.0
+                    total_calibration_time = 0.0
                     total_ksos_solver_time = 0.0
-                    total_other_time = 0.0
+                    total_mppi_time = 0.0
                     total_all_time = 0.0
                     for iter in range(controller.ksos_num_restart):
                         iter_start_time = time.perf_counter()
@@ -384,15 +405,47 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         # 1. Time KSOS rollout
                         # ============================================================
                         ksos_rollout_start = time.perf_counter()
-                        
+
                         policy_params = policy_params.replace(iter=iter)
+
+                        if log_l2s:
+                            # Mirror sample_ksos_knots' center/radius exactly,
+                            # for logging only (reads params, no RNG use).
+                            center = (
+                                np.zeros_like(np.asarray(policy_params.ksos_mean))
+                                if iter == 0
+                                else np.asarray(policy_params.ksos_mean)
+                            )
+                            radius = (controller.decay_rate**iter) * np.asarray(
+                                controller.task.u_max
+                            )
+                            l2s_lb.append(center - radius)
+                            l2s_ub.append(center + radius)
+
                         policy_params = jit_ksos_rollout(mjx_data, policy_params)
                         policy_params = jax.block_until_ready((policy_params))
 
                         ksos_rollout_time = time.perf_counter() - ksos_rollout_start
-                        
-                        other_start = time.perf_counter()
-                        # hyperparameter autocalibration
+
+                        if log_l2s:
+                            # Elite ranking must be captured here: solve_ksos
+                            # below overwrites params.lse_cost with the
+                            # filtered elite subset.
+                            l2s_knots.append(np.asarray(policy_params.knots))
+                            l2s_lse_cost.append(np.asarray(policy_params.lse_cost))
+                            l2s_cost_summed.append(
+                                np.asarray(policy_params.cost).sum(axis=-1)
+                            )
+                            l2s_elite_indices.append(
+                                np.argsort(np.asarray(policy_params.lse_cost))[
+                                    : controller.elite_num
+                                ]
+                            )
+
+                        # ============================================================
+                        # 2. Time GP sigma auto-calibration
+                        # ============================================================
+                        calibration_start = time.perf_counter()
                         if enable_auto_calib:
                             n_samples = policy_params.lse_cost.shape[0]
                             X = policy_params.knots.reshape(n_samples, -1)
@@ -425,25 +478,69 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                             )
                             controller.ksos_sigma = np.exp(res.x[0])
                             print(f"Auto-calibrated sigma: {controller.ksos_sigma}")
+                        calibration_time = time.perf_counter() - calibration_start
+
+                        if log_l2s:
+                            l2s_sigma.append(float(controller.ksos_sigma))
+
+                        # ============================================================
+                        # 3. Time the KSOS solve
+                        # ============================================================
                         ksos_solver_start = time.perf_counter()
                         policy_params = controller.solve_ksos(policy_params)
                         ksos_solver_time = time.perf_counter() - ksos_solver_start
 
+                        if log_l2s:
+                            l2s_ksos_mean.append(np.asarray(policy_params.ksos_mean))
+                            l2s_ksos_result_cost.append(
+                                float(np.asarray(policy_params.ksos_result_cost))
+                            )
+
                         policy_params = policy_params.replace(mean=policy_params.ksos_mean)
 
-                        # run MPPI optimization loop as a local search
-                        policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)    
-                        
-                        other_time = time.perf_counter() - other_start
+                        # ============================================================
+                        # 4. Time the MPPI local-search refinement
+                        # ============================================================
+                        mppi_start = time.perf_counter()
+                        policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
+                        policy_params = jax.block_until_ready(policy_params)
+                        mppi_time = time.perf_counter() - mppi_start
 
                         iter_total_time = time.perf_counter() - iter_start_time
 
                         total_ksos_rollout_time += ksos_rollout_time
+                        total_calibration_time += calibration_time
                         total_ksos_solver_time += ksos_solver_time
+                        total_mppi_time += mppi_time
 
-                        total_other_time += other_time
+                        total_all_time += iter_total_time
 
-                        total_all_time += iter_total_time 
+                    if log_l2s:
+                        num_passes = controller.ksos_num_restart
+                        l2s_path = os.path.join(
+                            l2s_log_dir,
+                            f"seed{current_seed}_cycle{int(cycle_count)}.npz",
+                        )
+                        np.savez(
+                            l2s_path,
+                            episode=current_seed,
+                            cycle=int(cycle_count),
+                            pass_index=np.arange(num_passes),
+                            qpos=np.array(mj_data.qpos),
+                            qvel=np.array(mj_data.qvel),
+                            mocap_pos=np.array(mj_data.mocap_pos),
+                            mocap_quat=np.array(mj_data.mocap_quat),
+                            time=mj_data.time,
+                            knots=np.stack(l2s_knots),
+                            lse_cost=np.stack(l2s_lse_cost),
+                            cost_summed=np.stack(l2s_cost_summed),
+                            lb=np.stack(l2s_lb),
+                            ub=np.stack(l2s_ub),
+                            elite_indices=np.stack(l2s_elite_indices),
+                            sigma=np.array(l2s_sigma),
+                            ksos_mean=np.stack(l2s_ksos_mean),
+                            ksos_result_cost=np.array(l2s_ksos_result_cost),
+                        )
             else:
                 policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
             
@@ -457,12 +554,14 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         f"cycle={cycle_count}, "
                         f"num_restart={controller.ksos_num_restart}, "
                         f"total_ksos_rollout_time={total_ksos_rollout_time:.6f}, "
+                        f"total_calibration_time={total_calibration_time:.6f}, "
                         f"total_ksos_solver_time={total_ksos_solver_time:.6f}, "
-                        f"total_other_time={total_other_time:.6f}, "
+                        f"total_mppi_time={total_mppi_time:.6f}, "
                         f"total_all_time={total_all_time:.6f}, "
                         f"avg_ksos_rollout_time={total_ksos_rollout_time / controller.ksos_num_restart:.6f}, "
+                        f"avg_calibration_time={total_calibration_time / controller.ksos_num_restart:.6f}, "
                         f"avg_ksos_solver_time={total_ksos_solver_time / controller.ksos_num_restart:.6f}, "
-                        f"avg_other_time={total_other_time / controller.ksos_num_restart:.6f}, "
+                        f"avg_mppi_time={total_mppi_time / controller.ksos_num_restart:.6f}, "
                         f"avg_all_time={total_all_time / controller.ksos_num_restart:.6f}, "
                         f"sigma={getattr(controller, 'ksos_sigma', None)}\n"
                     )
@@ -470,8 +569,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                     f"[Timing total] cycle={cycle_count}, "
                     f"num_restart={controller.ksos_num_restart}, "
                     f"total_ksos_rollout={total_ksos_rollout_time:.3f}s, "
+                    f"total_calibration={total_calibration_time:.3f}s, "
                     f"total_ksos_solver={total_ksos_solver_time:.3f}s, "
-                    f"total_other={total_other_time:.3f}s, "
+                    f"total_mppi={total_mppi_time:.3f}s, "
                     f"total_all={total_all_time:.3f}s"
                 )
             # data logging: rollouts_best (from jit_optimize) is already the
@@ -497,7 +597,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 )
 
             # cost evaulation
-            if cycle_count % 10 == 0:
+            if cycle_count % 10 == 0 or cycle_count >= max_cycles:
                 print(f"Cost for optimal action (cycle {cycle_count}): {best_cost_history}")
                     # If we collected any cost history during the interactive run, save a plot.
                 if (

@@ -3,12 +3,15 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from flax.struct import dataclass
+from scipy.stats import qmc
 from global_mppi.alg_base import SamplingBasedController, SamplingParams, Trajectory
 from global_mppi.risk import RiskStrategy
 from global_mppi.task_base import Task
 from mujoco import mjx
 from ksos_tools.solvers import ksos
 from jax import lax
+
+KSOS_SAMPLING_MODES = ("uniform", "gaussian", "linspace", "sobol")
 
 @dataclass
 class GlobalMPPIParams(SamplingParams):
@@ -53,6 +56,9 @@ class GlobalMPPI(SamplingBasedController):
         iterations: int = 1,
         ctrl_name : str = "globalmppi",
         ksos_solver: str = "newton-rs",
+        ksos_sampling: str = "uniform",
+        ksos_num_samples: int = 256,
+        elite_num: int = 80,
     ) -> None:
         """Initialize the controller.
 
@@ -94,8 +100,8 @@ class GlobalMPPI(SamplingBasedController):
         self.lse_lambda = 0.1
 
         # ksos parameters
-        self.ksos_num_samples = 256
-        self.elite_num = 80
+        self.ksos_num_samples = ksos_num_samples
+        self.elite_num = elite_num
         self.ksos_lambda = 1e-5
         self.ksos_sigma = 0.01
         self.ksos_epsilon = 1e-2
@@ -104,7 +110,23 @@ class GlobalMPPI(SamplingBasedController):
         self.ksos_linesearch = True
         self.ksos_num_restart = 5
         self.ksos_solver = ksos_solver
-        self.ksos_sampling = "uniform"
+        if ksos_sampling == "flow":
+            raise NotImplementedError(
+                "ksos_sampling='flow' is not implemented yet."
+            )
+        if ksos_sampling not in KSOS_SAMPLING_MODES:
+            raise ValueError(
+                f"Unknown ksos_sampling mode: {ksos_sampling!r} "
+                f"(expected one of {KSOS_SAMPLING_MODES + ('flow',)})"
+            )
+        self.ksos_sampling = ksos_sampling
+        if self.ksos_sampling == "sobol":
+            # Precomputed once (outside jit) since scipy's QMC sampler isn't
+            # traceable; `sample_ksos_knots` only does elementwise jax ops on
+            # this fixed unit-cube point set.
+            dim = num_knots * task.model.nu
+            sampler = qmc.Sobol(d=dim, scramble=True, seed=seed)
+            self.sobol_unit = jnp.asarray(sampler.random(self.ksos_num_samples))
         self.decay_rate = 0.80
         self.is_lse_smoothing = True
 
@@ -148,7 +170,7 @@ class GlobalMPPI(SamplingBasedController):
         previous KSOS mean (or zero on the first iteration) whose radius
         shrinks geometrically with `decay_rate` each iteration. The sampling
         distribution is controlled by `self.ksos_sampling`
-        ("linspace", "uniform", "gaussian", or "Sobol")."""
+        ("linspace", "uniform", "gaussian", or "sobol")."""
         rng, sample_rng = jax.random.split(params.rng)
 
         center = lax.cond(
@@ -192,9 +214,9 @@ class GlobalMPPI(SamplingBasedController):
                 ),
             )
             ksos_knots = center + radius * noise
-        elif self.ksos_sampling == "Sobol":
+        elif self.ksos_sampling == "sobol":
             dim = int(center.size)
-            u = self.sobol_unit  # (N, dim) in [0,1)
+            u = self.sobol_unit.astype(params.mean.dtype)  # (N, dim) in [0,1)
             shift = jax.random.uniform(sample_rng, (dim,), dtype=u.dtype)
             u = jnp.mod(u + shift, 1.0)
 

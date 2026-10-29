@@ -13,6 +13,9 @@ MUJOCO_LOG.TXT
 *.mp4
 *.log
 *.npy
+*.npz
 logs/
 wandb/
 test/log/
+data/l2s/raw/
+ksos_l2o/data/
