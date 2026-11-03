@@ -1,0 +1,23 @@
+# Config for `python -m ksos_l2o.train_dual --config ksos_l2o/configs/train_dual.yaml`
+data: ksos_l2o/data/dual_dataset.npz
+output_dir: ksos_l2o/data/dual_robust
+
+sigma: 1.0            # Laplace kernel scale of the dual
+k: 5                  # number of unrolled Newton iterations after the GNN; the only k trained and reported
+
+hidden_dim: 64        # GNN width
+gnn_layers: 3         # GNN message-passing layers
+
+loss: log             # "log" = log1p(gap / log_floor) (robust), "gap" = plain barrier gap
+log_floor: 1.0e-6
+
+epochs: 30
+steps_per_epoch: 100
+batch_size: 64
+learning_rate: 1.0e-3
+grad_clip: 1.0
+val_size: 512
+plateau_patience: 3
+plateau_factor: 0.5
+early_stopping_patience: 10
+seed: 0
