@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from .checkpoint import load_pytree
+from .context import pusht_context
 from .flow import ConditionalRealNVP
 
 
@@ -26,3 +27,17 @@ def sample(flow, params, z, context, lb, ub):
     """`z` (N, dim), `context` (context_dim,), `lb`/`ub` (dim,) -> knots (N, dim) inside [lb, ub]."""
     unit, _ = flow.sample_batch(params, z[None], context[None], jnp.zeros_like(lb), jnp.ones_like(ub))
     return lb + (ub - lb) * unit[0]
+
+
+def make_flow_sampler(sampler_dir, task, num_knots):
+    """-> (sampler(state, key, n) -> (n, num_knots, nu) knots, the flow's trained sigma_lse)
+    for GlobalMPPI(ksos_sampling="flow", ksos_flow_sampler=sampler)."""
+    flow, params, config = load_state_sampler(sampler_dir)
+    lb, ub = jnp.tile(task.u_min, num_knots), jnp.tile(task.u_max, num_knots)
+
+    def sampler(state, key, n):
+        z = jax.random.normal(key, (n, lb.size))
+        knots = sample(flow, params, z, pusht_context(state.qpos, state.qvel), lb, ub)
+        return knots.reshape(n, num_knots, task.model.nu)
+
+    return sampler, config["sigma_lse"]

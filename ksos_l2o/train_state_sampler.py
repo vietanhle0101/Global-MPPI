@@ -6,7 +6,8 @@ Candidates come from a proposal p: uniform over the control box with probability
 else a draw from the flow as of the epoch start (uniform only for the first --warmup-epochs). T is set
 per state so the relative effective sample size equals --target-ess. Validation uses the same recipe on
 held-out states; the best checkpoint is the one with the lowest cost of flow-only candidates.
---cost plain is one rollout per candidate; --cost lse is the controller's smoothed cost at --sigma-lse.
+--init starts from an existing checkpoint. --cost plain is one rollout per candidate; --cost lse is the controller's smoothed cost at --sigma-lse.
+Training states: synthetic (log-scale distance from the goal) plus --rollout-fraction mid-rollout states.
 No gradients through MJX.
 
     python -m ksos_l2o.train_state_sampler --cost lse --sigma-lse 0.3 --output ksos_l2o/data/sampler_state_lse_ais
@@ -24,10 +25,10 @@ from mujoco import mjx
 from global_mppi.algs import GlobalMPPI
 from global_mppi.tasks.pusht import PushT
 
-from .checkpoint import save_pytree
+from .checkpoint import load_pytree, save_pytree
 from .context import pusht_context
 from .flow import ConditionalRealNVP
-from .problem import rollout_cost, sample_initial_state
+from .problem import BLOCK_XY_RANGE, PUSHER_RADIUS_RANGE, rollout_cost, sample_initial_state
 from .train_sampler import plateau_step
 
 START_QPOS = jnp.array([0.1, 0.1, 1.3, 0.0, 0.0])  # examples/pusht.py
@@ -43,7 +44,30 @@ def sample_state(key, task):
     qvel_random = QVEL_RANGE * jax.random.uniform(k_vel, (5,), minval=-1.0, maxval=1.0)
     qpos = jnp.where(near_start, qpos_start, random_state.qpos)
     qvel = jnp.where(near_start, jnp.zeros(5), qvel_random)
+    return forward_state(task, qpos, qvel)
+
+
+def forward_state(task, qpos, qvel):
     return mjx.forward(task.model, mjx.make_data(task.model).replace(qpos=qpos, qvel=qvel))
+
+
+def sample_synthetic(key, task, near_start, log_fraction, min_scale):
+    """Random training state. With probability `log_fraction` the block's offset and angle from the goal are
+    scaled by a log-uniform factor in [min_scale, 1] (near-goal states), else drawn over the full range; with
+    probability `near_start` it is a jittered benchmark start."""
+    k_near, k_jit, k_vel, k_log, k_scale, k_xy, k_th, k_rad, k_phi = jax.random.split(key, 9)
+    log_scale = jnp.exp(jax.random.uniform(k_scale, minval=jnp.log(min_scale), maxval=0.0))
+    scale = jnp.where(jax.random.bernoulli(k_log, log_fraction), log_scale, 1.0)
+    block_xy = BLOCK_XY_RANGE * scale * jax.random.uniform(k_xy, (2,), minval=-1.0, maxval=1.0)
+    theta = jnp.pi * scale * jax.random.uniform(k_th, (), minval=-1.0, maxval=1.0)
+    radius = jax.random.uniform(k_rad, (), minval=PUSHER_RADIUS_RANGE[0], maxval=PUSHER_RADIUS_RANGE[1])
+    phi = jax.random.uniform(k_phi, (), minval=-jnp.pi, maxval=jnp.pi)
+    pusher = block_xy + radius * jnp.array([jnp.cos(phi), jnp.sin(phi)]) - jnp.array([0.0, 0.1])
+    qpos_random = jnp.concatenate((block_xy, theta[None], pusher))
+    qvel_random = QVEL_RANGE * jax.random.uniform(k_vel, (5,), minval=-1.0, maxval=1.0)
+    qpos_start = START_QPOS + JITTER * jax.random.uniform(k_jit, (5,), minval=-1.0, maxval=1.0)
+    near = jax.random.bernoulli(k_near, near_start)
+    return forward_state(task, jnp.where(near, qpos_start, qpos_random), jnp.where(near, jnp.zeros(5), qvel_random))
 
 
 def ess_weights(costs, target_ess, log_prop=0.0, iters=40):
@@ -65,8 +89,11 @@ def ess_weights(costs, target_ess, log_prop=0.0, iters=40):
     return weights(log_t), jnp.exp(log_t)
 
 
-def make_batch_fn(ctrl, flow, cost, num_samples):
-    """jitted (key, batch_size, sampler_params, uniform_fraction) -> contexts, unit candidates, costs, log proposal."""
+def make_batch_fn(ctrl, flow, cost, num_samples, near_start, log_fraction, min_scale, rollout_fraction, derive_samples):
+    """-> (batch, idle). jitted batch(key, batch_size, sampler_params, uniform_fraction) -> contexts, unit
+    candidates, costs, log proposal; idle(key, batch_size) -> cost of zero controls on batch's states.
+    A `rollout_fraction` of the states are mid-rollout states: the state some random time into the best of
+    `derive_samples` uniform candidates rolled out from a synthetic state (realistic mid-push states)."""
     task = ctrl.task
     shape = (ctrl.num_knots, task.model.nu)
     dim = shape[0] * shape[1]
@@ -80,9 +107,39 @@ def make_batch_fn(ctrl, flow, cost, num_samples):
             return rollout_cost(ctrl, state, knots)
         return ctrl.lse_smoothing_rollout(state, tk, knots, ctrl.init_params().replace(rng=key, iter=0)).lse_cost
 
+    def rollout_state(state, key):
+        k_cand, k_time = jax.random.split(key)
+        knots = lb + (ub - lb) * jax.random.uniform(k_cand, (derive_samples, *shape))
+        best = knots[jnp.argmin(rollout_cost(ctrl, state, knots))][None]
+        controls = ctrl.interp_func(jnp.linspace(tk[0], tk[-1], ctrl.ctrl_steps), tk, best)
+        states, _ = ctrl.eval_rollouts(ctrl.model, state, controls, best)
+        t = jax.random.randint(k_time, (), 0, controls.shape[1])
+        return states.qpos[0, t], states.qvel[0, t]
+
+    def draw_states(key, batch_size):
+        k_state, k_roll, k_use = jax.random.split(key, 3)
+        states = jax.vmap(lambda k: sample_synthetic(k, task, near_start, log_fraction, min_scale))(jax.random.split(k_state, batch_size))
+        if rollout_fraction > 0:
+            qpos, qvel = jax.vmap(rollout_state)(states, jax.random.split(k_roll, batch_size))
+            use = jax.random.bernoulli(k_use, rollout_fraction, (batch_size, 1))
+            states = jax.vmap(lambda qp, qv: forward_state(task, qp, qv))(
+                jnp.where(use, qpos, states.qpos), jnp.where(use, qvel, states.qvel))
+        return states
+
+    def idle(key, batch_size):
+        states = draw_states(jax.random.split(key, 5)[0], batch_size)
+        knots = jnp.zeros((1, *shape))
+
+        def one(state, k):
+            if cost == "plain":
+                return rollout_cost(ctrl, state, knots)[0]
+            return ctrl.lse_smoothing_rollout(state, tk, knots, ctrl.init_params().replace(rng=k, iter=0)).lse_cost.reshape(())
+
+        return jax.vmap(one)(states, jax.random.split(key, batch_size))
+
     def batch(key, batch_size, sampler_params, uniform_fraction):
         k_state, k_u, k_z, k_mix, k_cost = jax.random.split(key, 5)
-        states = jax.vmap(lambda k: sample_state(k, task))(jax.random.split(k_state, batch_size))
+        states = draw_states(k_state, batch_size)
         contexts = jax.vmap(pusht_context)(states.qpos, states.qvel)
         unit = jax.random.uniform(k_u, (batch_size, num_samples, dim))
         log_prop = jnp.zeros((batch_size, num_samples))  # log density of the uniform proposal
@@ -96,7 +153,7 @@ def make_batch_fn(ctrl, flow, cost, num_samples):
         costs = jax.vmap(candidate_cost)(states, unit, jax.random.split(k_cost, batch_size))
         return contexts, unit, costs, log_prop
 
-    return jax.jit(batch, static_argnums=(1, 3))
+    return jax.jit(batch, static_argnums=(1, 3)), jax.jit(idle, static_argnums=1)
 
 
 def main(a):
@@ -110,8 +167,11 @@ def main(a):
     context_dim = pusht_context(jnp.zeros(5), jnp.zeros(5)).shape[0]
 
     flow = ConditionalRealNVP(dim, context_dim, num_layers=a.layers, hidden_dim=a.hidden)
-    batch_fn = make_batch_fn(ctrl, flow, a.cost, a.num_samples)
+    batch_fn, idle_fn = make_batch_fn(ctrl, flow, a.cost, a.num_samples, a.near_start_prob, a.log_scale_fraction, a.min_scale,
+                                      a.rollout_fraction, a.derive_samples)
     params = flow.init(jax.random.PRNGKey(a.seed))
+    if a.init:  # continue from a trained flow (same --layers/--hidden)
+        params = jax.tree_util.tree_map(jnp.asarray, load_pytree(params, Path(a.init) / "checkpoint.npz"))
     zeros, ones = jnp.zeros(dim), jnp.ones(dim)
     optimizer = optax.inject_hyperparams(
         lambda learning_rate: optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate))
@@ -126,6 +186,7 @@ def main(a):
     val_key = jax.random.PRNGKey(a.seed + 500)
     val_raw = batch_fn(val_key, a.val_size, params, 1.0)  # held-out states; uniform candidates (epoch 0 and the uniform-cost reference)
     val, uniform_cost = jax.block_until_ready(weigh(*val_raw)), float(val_raw[2].mean())
+    idle_cost = float(idle_fn(val_key, a.val_size).mean())  # zero controls on the same validation states
 
     out = Path(a.output); out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(
@@ -158,7 +219,7 @@ def main(a):
             save_pytree(params, out / "checkpoint.npz")
         else:
             early += 1
-        print(f"epoch {epoch:3d} train {np.mean(losses):.3f} val {v:.3f} flow cost {flow_cost:.1f} (uniform {uniform_cost:.1f}) lr {lr:.1e}"
+        print(f"epoch {epoch:3d} train {np.mean(losses):.3f} val {v:.3f} flow cost {flow_cost:.1f} (uniform {uniform_cost:.1f}, idle {idle_cost:.1f}) lr {lr:.1e}"
               f"{' (reduced)' if reduced else ''}{' (best)' if improved else ''}", flush=True)
         if early >= 10:
             print("early stopping"); break
@@ -173,6 +234,11 @@ if __name__ == "__main__":
     p.add_argument("--target-ess", type=float, default=0.15)
     p.add_argument("--uniform-fraction", type=float, default=0.25, help="share of uniform candidates; 1 = uniform only (earlier behavior)")
     p.add_argument("--warmup-epochs", type=int, default=1, help="initial epochs with uniform candidates only")
+    p.add_argument("--near-start-prob", type=float, default=0.1, help="share of synthetic states that are jittered benchmark starts")
+    p.add_argument("--log-scale-fraction", type=float, default=1 / 3, help="share of synthetic states with log-scaled (near-goal) block offset")
+    p.add_argument("--min-scale", type=float, default=0.2, help="smallest block-offset scale for the log-scaled states")
+    p.add_argument("--rollout-fraction", type=float, default=0.4, help="share of states taken mid-rollout of a good candidate")
+    p.add_argument("--derive-samples", type=int, default=32, help="uniform candidates tried to find the rollout that gives a state")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--steps-per-epoch", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=64)
@@ -181,5 +247,6 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--hidden", type=int, default=128)
+    p.add_argument("--init", default=None, help="sampler dir whose checkpoint to start from (same --layers/--hidden)")
     p.add_argument("--seed", type=int, default=0)
     main(p.parse_args())

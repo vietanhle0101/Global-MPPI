@@ -399,6 +399,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                     total_ksos_solver_time = 0.0
                     total_mppi_time = 0.0
                     total_all_time = 0.0
+                    pass_cost_log = []
                     for iter in range(controller.ksos_num_restart):
                         iter_start_time = time.perf_counter()
                         # ============================================================
@@ -477,7 +478,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                                 bounds=[(np.log(1e-2), np.log(30.0))],
                             )
                             controller.ksos_sigma = np.exp(res.x[0])
-                            print(f"Auto-calibrated sigma: {controller.ksos_sigma}")
                         calibration_time = time.perf_counter() - calibration_start
 
                         if log_l2s:
@@ -497,6 +497,10 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                             )
 
                         policy_params = policy_params.replace(mean=policy_params.ksos_mean)
+                        pass_costs = (
+                            float(jnp.min(policy_params.lse_cost)),
+                            float(policy_params.ksos_result_cost),
+                        )
 
                         # ============================================================
                         # 4. Time the MPPI local-search refinement
@@ -505,6 +509,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
                         policy_params = jax.block_until_ready(policy_params)
                         mppi_time = time.perf_counter() - mppi_start
+                        pass_costs += (float(rollouts_best.costs.sum()),)
+                        pass_cost_log.append(pass_costs)
 
                         iter_total_time = time.perf_counter() - iter_start_time
 
@@ -551,7 +557,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             if controller.ctrl_name == "globalmppi":
                 with open(timing_file, "a") as f:
                     f.write(
-                        f"cycle={cycle_count}, "
+                        f"step={cycle_count}, "
                         f"num_restart={controller.ksos_num_restart}, "
                         f"total_ksos_rollout_time={total_ksos_rollout_time:.6f}, "
                         f"total_calibration_time={total_calibration_time:.6f}, "
@@ -565,8 +571,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         f"avg_all_time={total_all_time / controller.ksos_num_restart:.6f}, "
                         f"sigma={getattr(controller, 'ksos_sigma', None)}\n"
                     )
-                print(
-                    f"[Timing total] cycle={cycle_count}, "
+                timing_line = (
+                    f"[Timing total] step={cycle_count}, "
                     f"num_restart={controller.ksos_num_restart}, "
                     f"total_ksos_rollout={total_ksos_rollout_time:.3f}s, "
                     f"total_calibration={total_calibration_time:.3f}s, "
@@ -579,12 +585,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # no need to re-roll-out via get_cost_with_best_samples.
             best_cost = rollouts_best.costs.sum()
             if controller.ctrl_name == "globalmppi":
-                print(f"\nCycle {cycle_count}: Best cost: {best_cost}")
                 best_cost_history.append(best_cost)
                 error_history.append(best_sample_cost - best_cost)
             else:
                 costs = np.sum(rollouts.costs, axis=1)  # sum over time steps
-                print(f"\nCycle {cycle_count}: Best cost: {best_cost}, Best sample: {np.min(costs)}")
+                print(f"\nStep {cycle_count}: Best cost: {best_cost}, Best sample: {np.min(costs)}")
                 best_cost_history.append(best_cost)
                 error_history.append(np.min(costs) - best_cost)
 
@@ -598,7 +603,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # cost evaulation
             if cycle_count % 10 == 0 or cycle_count >= max_cycles:
-                print(f"Cost for optimal action (cycle {cycle_count}): {best_cost_history}")
+                # print(f"Cost for optimal action (step {cycle_count}): {best_cost_history}")
                     # If we collected any cost history during the interactive run, save a plot.
                 if (
                     'best_cost_history' in locals()
@@ -622,8 +627,16 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                     break
                 
             plan_time = time.time() - plan_start
-            print(f"\nCycle {cycle_count}: plan time: {plan_time:.4f}s"),
-            cycle_count += 1.0
+            print(f"\nStep {cycle_count}: computation time: {plan_time:.4f}s")
+            if controller.ctrl_name == "globalmppi":
+                print(timing_line)
+                for k, (cand, ksos_c, mppi_c) in enumerate(pass_cost_log):
+                    label = f" (pass {k})" if len(pass_cost_log) > 1 else ""
+                    print(
+                        f"  Costs{label}: best candidate (LSE) {cand:.3f}, "
+                        f"KSOS solution {ksos_c:.3f}, MPPI solution {mppi_c:.3f}"
+                    )
+            cycle_count += 1
             
             # Visualize the rollouts
             if show_traces:

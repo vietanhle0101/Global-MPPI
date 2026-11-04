@@ -1,4 +1,4 @@
-from typing import Any, Literal, Tuple
+from typing import Any, Callable, Literal, Tuple
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -11,7 +11,7 @@ from mujoco import mjx
 from ksos_tools.solvers import ksos
 from jax import lax
 
-KSOS_SAMPLING_MODES = ("uniform", "gaussian", "linspace", "sobol")
+KSOS_SAMPLING_MODES = ("uniform", "gaussian", "linspace", "sobol", "flow")
 
 @dataclass
 class GlobalMPPIParams(SamplingParams):
@@ -59,6 +59,7 @@ class GlobalMPPI(SamplingBasedController):
         ksos_sampling: str = "uniform",
         ksos_num_samples: int = 256,
         elite_num: int = 80,
+        ksos_flow_sampler: Callable = None,
     ) -> None:
         """Initialize the controller.
 
@@ -77,6 +78,10 @@ class GlobalMPPI(SamplingBasedController):
                          Defaults to "zero" (zero-order hold).
             num_knots: The number of knots in the control spline.
             iterations: The number of optimization iterations to perform.
+            ksos_flow_sampler: For ksos_sampling="flow": a jittable callable
+                (state, key, n) -> (n, num_knots, nu) candidate knots, used for
+                pass 0 of the KSOS solve; later passes sample uniformly in the
+                shrinking trust region, as in ksos_sampling="uniform".
         """
         super().__init__(
             task,
@@ -97,6 +102,9 @@ class GlobalMPPI(SamplingBasedController):
         # lse parameters
         self.lse_num_samples = 100
         self.lse_smoothing_sigma = jnp.array([0.3, 0.2, 0.1, 0.05, 0.001])
+        # MPPI refinement noise per pass; defaults to the LSE schedule but can be
+        # set separately (e.g. when pass 0 uses a flow trained at a tiny sigma)
+        self.mppi_noise = self.lse_smoothing_sigma
         self.lse_lambda = 0.1
 
         # ksos parameters
@@ -110,16 +118,15 @@ class GlobalMPPI(SamplingBasedController):
         self.ksos_linesearch = True
         self.ksos_num_restart = 5
         self.ksos_solver = ksos_solver
-        if ksos_sampling == "flow":
-            raise NotImplementedError(
-                "ksos_sampling='flow' is not implemented yet."
-            )
+        if ksos_sampling == "flow" and ksos_flow_sampler is None:
+            raise ValueError("ksos_sampling='flow' needs a ksos_flow_sampler")
         if ksos_sampling not in KSOS_SAMPLING_MODES:
             raise ValueError(
                 f"Unknown ksos_sampling mode: {ksos_sampling!r} "
-                f"(expected one of {KSOS_SAMPLING_MODES + ('flow',)})"
+                f"(expected one of {KSOS_SAMPLING_MODES})"
             )
         self.ksos_sampling = ksos_sampling
+        self.ksos_flow_sampler = ksos_flow_sampler
         if self.ksos_sampling == "sobol":
             # Precomputed once (outside jit) since scipy's QMC sampler isn't
             # traceable; `sample_ksos_knots` only does elementwise jax ops on
@@ -158,19 +165,23 @@ class GlobalMPPI(SamplingBasedController):
                 self.task.model.nu,
             ),
         )
-        sigma = self.lse_smoothing_sigma[params.iter]
+        sigma = self.mppi_noise[params.iter]
         controls = params.mean + sigma * noise
-        jax.debug.print("sigma: {}", sigma)
+        # jax.debug.print("sigma: {}", sigma)
 
         return controls, params.replace(rng=rng)
 
-    def sample_ksos_knots(self, params: GlobalMPPIParams) -> Tuple[jax.Array, GlobalMPPIParams]:
+    def sample_ksos_knots(
+        self, params: GlobalMPPIParams, state: mjx.Data = None
+    ) -> Tuple[jax.Array, GlobalMPPIParams]:
         """Sample `ksos_num_samples` candidate knot sequences for the KSOS
         solver. Candidates are drawn from a trust region centered at the
         previous KSOS mean (or zero on the first iteration) whose radius
         shrinks geometrically with `decay_rate` each iteration. The sampling
         distribution is controlled by `self.ksos_sampling`
-        ("linspace", "uniform", "gaussian", or "sobol")."""
+        ("linspace", "uniform", "gaussian", "sobol", or "flow"; "flow" draws
+        pass 0 from `ksos_flow_sampler(state, ...)` and the later passes
+        uniformly in the trust region)."""
         rng, sample_rng = jax.random.split(params.rng)
 
         center = lax.cond(
@@ -203,6 +214,19 @@ class GlobalMPPI(SamplingBasedController):
                 ),                          
                 minval=center - radius,
                 maxval=center + radius,
+            )
+        elif self.ksos_sampling == "flow":
+            if state is None:
+                raise ValueError("ksos_sampling='flow' needs the state")
+            shape = (self.ksos_num_samples, self.num_knots, self.task.model.nu)
+            flow_rng = jax.random.fold_in(sample_rng, 1)
+            ksos_knots = lax.cond(
+                jnp.equal(params.iter, 0),
+                lambda _: self.ksos_flow_sampler(state, flow_rng, self.ksos_num_samples).astype(params.mean.dtype),
+                lambda _: jax.random.uniform(
+                    sample_rng, shape, minval=center - radius, maxval=center + radius
+                ).astype(params.mean.dtype),
+                operand=None,
             )
         elif self.ksos_sampling == "gaussian":
             noise = jax.random.normal(
@@ -331,7 +355,7 @@ class GlobalMPPI(SamplingBasedController):
         params = params.replace(tk=new_tk, mean=new_mean)
 
         # sample knots
-        knots, params = self.sample_ksos_knots(params)
+        knots, params = self.sample_ksos_knots(params, state)
         knots = jnp.clip(knots, self.task.u_min, self.task.u_max)
 
         rng, dr_rng = jax.random.split(params.rng)
@@ -417,7 +441,6 @@ class GlobalMPPI(SamplingBasedController):
         return params.replace(
             ksos_mean=updated_knots,
             ksos_result_cost=info["cost"],
-            lse_cost=lse_costs,
         )
 
     def update_params(

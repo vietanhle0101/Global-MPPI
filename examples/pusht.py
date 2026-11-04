@@ -47,15 +47,48 @@ parser.add_argument(
     choices=["uniform", "sobol", "flow"],
     default="uniform",
     help="Candidate-knot sampling distribution used by GlobalMPPI's KSOS "
-    "pass (default: uniform; unchanged behavior). 'flow' is not implemented "
-    "yet.",
+    "pass (default: uniform; unchanged behavior). 'flow' draws pass 0 from "
+    "the trained sampler in --ksos-flow-dir; later passes sample uniformly "
+    "in the shrinking trust region.",
+)
+parser.add_argument(
+    "--ksos-flow-dir",
+    default=None,
+    help="Trained sampler directory (ksos_l2o/train_state_sampler.py output); "
+    "required for --ksos-sampling flow",
+)
+parser.add_argument(
+    "--ksos-num-samples",
+    type=int,
+    default=256,
+    help="KSOS candidates per pass (default: 256)",
+)
+parser.add_argument(
+    "--ksos-passes",
+    type=int,
+    default=5,
+    help="KSOS passes (restarts) per control cycle, each followed by MPPI "
+    "(default: 5); 1 = a single pass, e.g. with --ksos-sampling flow",
+)
+parser.add_argument(
+    "--mppi-noise",
+    type=float,
+    default=0.3,
+    help="With --ksos-sampling flow: MPPI noise std in pass 0 (default 0.3, "
+    "the original schedule value; the KSOS smoothing there uses the flow's sigma)",
+)
+parser.add_argument(
+    "--elite-num",
+    type=int,
+    default=80,
+    help="KSOS elites kept per pass; at most --ksos-num-samples (default: 80)",
 )
 parser.add_argument(
     "--seeds",
-    type=int,
-    nargs="+",
+    type=lambda s: [int(x) for x in s.split(",")],
     default=list(range(6)),
-    help="Seeds to run, one episode per seed (default: 0 1 2 3 4 5)",
+    help="Comma-separated seeds, one episode per seed, e.g. 2 or 0,1,2 "
+    "(default: 0,1,2,3,4,5)",
 )
 parser.add_argument(
     "--cycles",
@@ -174,6 +207,12 @@ elif args.algorithm == "dial":
     )
 elif args.algorithm == "globalmppi":
     print("Running GlobalMPPI")
+    flow_sampler = None
+    if args.ksos_sampling == "flow":
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, for ksos_l2o
+        from ksos_l2o.state_flow import make_flow_sampler
+
+        flow_sampler, flow_sigma = make_flow_sampler(args.ksos_flow_dir, task, 6)
     ctrl = GlobalMPPI(
         task,
         num_samples=256,
@@ -185,7 +224,15 @@ elif args.algorithm == "globalmppi":
         iterations=5,
         ksos_solver=args.ksos_solver,
         ksos_sampling=args.ksos_sampling,
+        ksos_num_samples=args.ksos_num_samples,
+        elite_num=args.elite_num,
+        ksos_flow_sampler=flow_sampler,
     )
+    ctrl.ksos_num_restart = args.ksos_passes
+    if flow_sampler is not None and flow_sigma is not None:
+        # pass 0 smooths at the sigma the flow was trained for
+        ctrl.lse_smoothing_sigma = ctrl.lse_smoothing_sigma.at[0].set(flow_sigma)
+        ctrl.mppi_noise = ctrl.mppi_noise.at[0].set(args.mppi_noise)
 
 # Run the interactive simulation
 for trial_idx in args.seeds:
