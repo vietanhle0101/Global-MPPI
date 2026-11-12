@@ -1,6 +1,6 @@
 import time
 from datetime import datetime
-from typing import Sequence
+from typing import Callable, Sequence
 import os
 
 import jax
@@ -137,6 +137,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     wandb_entity: str = None,
     headless: bool = False,
     log_l2s: bool = False,
+    goal_reached: Callable[[mujoco.MjData], bool] = None,
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -164,12 +165,13 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         reference: The reference trajectory (qs) to visualize.
         reference_fps: The frame rate of the reference trajectory.
         record_video: Whether to record a video of the simulation.
+        goal_reached: Optional check on mj_data; the episode ends when it is True.
     """
     # Report the planning horizon in seconds for debugging
     print(
-        f"Planning with {controller.ctrl_steps} steps "
-        f"over a {controller.plan_horizon} second horizon "
-        f"with {controller.num_knots} knots."
+        f"Plan: {controller.plan_horizon} s horizon, {controller.num_knots} knots, "
+        f"rolled out in {controller.ctrl_steps} planner steps of "
+        f"{1000 * controller.task.dt:.0f} ms."
     )
 
     # Figure out how many sim steps to run before replanning
@@ -179,8 +181,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     step_dt = sim_steps_per_replan * mj_model.opt.timestep
     actual_frequency = 1.0 / step_dt
     print(
-        f"Planning at {actual_frequency} Hz, "
-        f"simulating at {1.0 / mj_model.opt.timestep} Hz"
+        f"Replanning every {1000 * step_dt:.0f} ms ({actual_frequency:.0f} Hz); each plan is "
+        f"executed for {sim_steps_per_replan} simulator steps of "
+        f"{1000 * mj_model.opt.timestep:.0f} ms ({1.0 / mj_model.opt.timestep:.0f} Hz physics)."
     )
 
     # Initialize the controller
@@ -203,6 +206,19 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         jit_optimize = jax.jit(controller.optimize)
         policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
         policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
+        # rollout of the current mean, for the safeguards below
+        jit_mean_rollout = jax.jit(
+            lambda state, params: controller.rollout(state, params.tk, params.mean[None, ...])
+        )
+        jit_mean_rollout(mjx_data, policy_params)
+        # best KSOS candidate by plain rollout cost
+        def best_candidate(state, params):
+            rollouts = controller.rollout(state, params.tk, params.knots)
+            idx = jnp.argmin(rollouts.costs.sum(axis=1))
+            return params.knots[idx], jax.tree.map(lambda x: x[idx][None], rollouts)
+
+        jit_best_candidate = jax.jit(best_candidate)
+        jit_best_candidate(mjx_data, policy_params)
     else:
 
         jit_optimize = jax.jit(controller.optimize)
@@ -376,6 +392,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 time=mj_data.time,
             )
             robot_pos_history.append(np.array(mj_data.qpos))
+            reached = goal_reached is not None and bool(goal_reached(mj_data))
 
             # Do a replanning step
             plan_start = time.time()
@@ -497,20 +514,31 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                             )
 
                         policy_params = policy_params.replace(mean=policy_params.ksos_mean)
-                        pass_costs = (
-                            float(jnp.min(policy_params.lse_cost)),
-                            float(policy_params.ksos_result_cost),
-                        )
 
                         # ============================================================
                         # 4. Time the MPPI local-search refinement
                         # ============================================================
                         mppi_start = time.perf_counter()
+                        # safeguard: use the best candidate if it beats the KSOS mean
+                        cand_knots, cand_best = jit_best_candidate(mjx_data, policy_params)
+                        ksos_best = jit_mean_rollout(mjx_data, policy_params)
+                        cand_cost = float(cand_best.costs.sum())
+                        ksos_cost = float(ksos_best.costs.sum())
+                        use_cand = cand_cost < ksos_cost
+                        if use_cand:
+                            policy_params = policy_params.replace(mean=cand_knots)
+                            ksos_best = cand_best
+                        ksos_mean = policy_params.mean
                         policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
                         policy_params = jax.block_until_ready(policy_params)
                         mppi_time = time.perf_counter() - mppi_start
-                        pass_costs += (float(rollouts_best.costs.sum()),)
-                        pass_cost_log.append(pass_costs)
+                        # safeguard: keep the pre-MPPI plan if MPPI made it worse
+                        mppi_cost = float(rollouts_best.costs.sum())
+                        keep_ksos = mppi_cost > float(ksos_best.costs.sum())
+                        if keep_ksos:
+                            policy_params = policy_params.replace(mean=ksos_mean)
+                            rollouts_best = ksos_best
+                        pass_cost_log.append((cand_cost, ksos_cost, mppi_cost, use_cand, keep_ksos))
 
                         iter_total_time = time.perf_counter() - iter_start_time
 
@@ -602,7 +630,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 )
 
             # cost evaulation
-            if cycle_count % 10 == 0 or cycle_count >= max_cycles:
+            if cycle_count % 10 == 0 or cycle_count >= max_cycles or reached:
                 # print(f"Cost for optimal action (step {cycle_count}): {best_cost_history}")
                     # If we collected any cost history during the interactive run, save a plot.
                 if (
@@ -622,19 +650,24 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         out_cost_npy,
                         np.asarray(best_cost_history, dtype=float),
                     )
+                if reached:
+                    print(f"goal reached at step {cycle_count} (t = {mj_data.time:.2f} s)")
+                    break
                 if cycle_count >= max_cycles:
-                    print(policy_params.mean[None, ...])
                     break
                 
             plan_time = time.time() - plan_start
             print(f"\nStep {cycle_count}: computation time: {plan_time:.4f}s")
             if controller.ctrl_name == "globalmppi":
                 print(timing_line)
-                for k, (cand, ksos_c, mppi_c) in enumerate(pass_cost_log):
+                for k, (cand, ksos_c, mppi_c, used_cand, kept) in enumerate(pass_cost_log):
                     label = f" (pass {k})" if len(pass_cost_log) > 1 else ""
                     print(
-                        f"  Costs{label}: best candidate (LSE) {cand:.3f}, "
-                        f"KSOS solution {ksos_c:.3f}, MPPI solution {mppi_c:.3f}"
+                        f"  Costs{label}: best candidate {cand:.3f}, "
+                        f"KSOS solution {ksos_c:.3f}"
+                        + (" (worse, used best candidate)" if used_cand else "")
+                        + f", MPPI solution {mppi_c:.3f}"
+                        + (" (worse, kept pre-MPPI plan)" if kept else "")
                     )
             cycle_count += 1
             
@@ -733,12 +766,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             if elapsed < step_dt:
                 time.sleep(step_dt - elapsed)
 
-            # Print some timing information
-            rtr = step_dt / (time.time() - start_time)
-            print(
-                f"Realtime rate: {rtr:.2f}, plan time: {plan_time:.4f}s",
-                end="\r",
-            )
 
     # Preserve the last printout
     print(f"finish the seed {current_seed} interactive simulation for controller {controller.ctrl_name}.")

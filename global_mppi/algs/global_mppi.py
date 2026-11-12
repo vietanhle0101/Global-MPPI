@@ -105,6 +105,8 @@ class GlobalMPPI(SamplingBasedController):
         # MPPI refinement noise per pass; defaults to the LSE schedule but can be
         # set separately (e.g. when pass 0 uses a flow trained at a tiny sigma)
         self.mppi_noise = self.lse_smoothing_sigma
+        # KSOS candidate 0 = previous plan shifted to the current time
+        self.ksos_warm_start = False
         self.lse_lambda = 0.1
 
         # ksos parameters
@@ -167,6 +169,8 @@ class GlobalMPPI(SamplingBasedController):
         )
         sigma = self.mppi_noise[params.iter]
         controls = params.mean + sigma * noise
+        # sample 0 = unperturbed mean
+        controls = controls.at[0].set(params.mean)
         # jax.debug.print("sigma: {}", sigma)
 
         return controls, params.replace(rng=rng)
@@ -356,6 +360,8 @@ class GlobalMPPI(SamplingBasedController):
 
         # sample knots
         knots, params = self.sample_ksos_knots(params, state)
+        if self.ksos_warm_start:
+            knots = knots.at[0].set(new_mean)
         knots = jnp.clip(knots, self.task.u_min, self.task.u_max)
 
         rng, dr_rng = jax.random.split(params.rng)

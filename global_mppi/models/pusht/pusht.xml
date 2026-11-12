@@ -16,9 +16,9 @@
     </body>
 
     <body name="block" pos="0.0 0.0 0.0095">
-      <joint name="T_x" type="slide" pos="0 0 0" axis="1 0 0" />
-      <joint name="T_y" type="slide" pos="0 0 0" axis="0 1 0" />
-      <joint name="T_z" axis="0 0 1"/>
+      <joint name="T_x" type="slide" pos="0 0 0" axis="1 0 0" damping="0.2" frictionloss="0.01" />
+      <joint name="T_y" type="slide" pos="0 0 0" axis="0 1 0" damping="0.2" frictionloss="0.01" />
+      <joint name="T_z" axis="0 0 1" damping="1e-4" frictionloss="1e-3" />
       <geom name="bottom" type="box" size=".01 0.04 0.01" />
       <geom name="top" type="box" size=".03 0.01 0.01" pos="0.0 0.03 0.0" />
     </body>

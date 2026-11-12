@@ -28,7 +28,7 @@ from global_mppi.tasks.pusht import PushT
 from .checkpoint import load_pytree, save_pytree
 from .context import pusht_context
 from .flow import ConditionalRealNVP
-from .problem import BLOCK_XY_RANGE, PUSHER_RADIUS_RANGE, rollout_cost, sample_initial_state
+from .problem import BLOCK_XY_RANGE, rollout_cost, sample_initial_state
 from .train_sampler import plateau_step
 
 START_QPOS = jnp.array([0.1, 0.1, 1.3, 0.0, 0.0])  # examples/pusht.py
@@ -51,18 +51,56 @@ def forward_state(task, qpos, qvel):
     return mjx.forward(task.model, mjx.make_data(task.model).replace(qpos=qpos, qvel=qvel))
 
 
-def sample_synthetic(key, task, near_start, log_fraction, min_scale):
-    """Random training state. With probability `log_fraction` the block's offset and angle from the goal are
-    scaled by a log-uniform factor in [min_scale, 1] (near-goal states), else drawn over the full range; with
-    probability `near_start` it is a jittered benchmark start."""
-    k_near, k_jit, k_vel, k_log, k_scale, k_xy, k_th, k_rad, k_phi = jax.random.split(key, 9)
+GOAL_RADIUS = (0.01, 0.06)  # block distance from the goal for the `goal_fraction` states
+GOAL_ANGLE = 0.3            # |block angle| bound for those states
+PUSHER_R = 0.01             # pusher sphere radius
+T_BOXES = ((jnp.array([0.0, 0.0]), jnp.array([0.01, 0.04])), (jnp.array([0.0, 0.03]), jnp.array([0.03, 0.01])))  # (centre, half size) in the block frame
+
+
+def block_sdf(p):
+    """Signed distance from a point in the block frame to the T (union of its two boxes)."""
+    def box(centre, half):
+        q = jnp.abs(p - centre) - half
+        return jnp.linalg.norm(jnp.maximum(q, 0.0) + 1e-12) + jnp.minimum(jnp.max(q), 0.0)
+    return jnp.minimum(box(*T_BOXES[0]), box(*T_BOXES[1]))
+
+
+def place_pusher(key, block_xy, theta, clearance, contact_prob):
+    """Pusher qpos around the block: a random direction, then the pusher is put just outside the T's surface
+    (touching it) plus a gap U(0, `clearance`), or exactly touching with probability `contact_prob`. A point
+    that would overlap the block is pushed out along the distance gradient until it touches."""
+    k_dir, k_gap, k_contact = jax.random.split(key, 3)
+    phi = jax.random.uniform(k_dir, (), minval=-jnp.pi, maxval=jnp.pi)
+    gap = jnp.where(jax.random.bernoulli(k_contact, contact_prob), 0.0, clearance * jax.random.uniform(k_gap))
+    direction = jnp.array([jnp.cos(phi), jnp.sin(phi)])
+    rot = jnp.array([[jnp.cos(theta), -jnp.sin(theta)], [jnp.sin(theta), jnp.cos(theta)]])  # block frame -> world
+    ts = jnp.linspace(0.0, 0.08, 81)
+    inside = jax.vmap(lambda t: block_sdf(t * direction) <= 0.0)(ts)
+    t_out = ts[jnp.max(jnp.where(inside, jnp.arange(ts.shape[0]), 0))]  # outermost point of the T along this ray
+    point = (t_out + 0.005) * direction
+    target = PUSHER_R + gap
+    for _ in range(4):  # move to the wanted distance from the surface (sdf == target) along the gradient
+        point = point + (target - block_sdf(point)) * jax.grad(block_sdf)(point)
+    return block_xy + rot @ point - jnp.array([0.0, 0.1])  # qpos is an offset from (0, 0.1)
+
+
+def sample_synthetic(key, task, near_start, log_fraction, min_scale, goal_fraction=0.0, block_range=BLOCK_XY_RANGE,
+                     angle_range=float(np.pi), pusher_clearance=0.10, contact_prob=0.3, goal_max=GOAL_RADIUS[1]):
+    """Random training state: block within `block_range` / `angle_range` of the goal, pusher placed by
+    place_pusher. With probability `goal_fraction` the block is [GOAL_RADIUS[0], goal_max] from the goal at
+    |angle| < GOAL_ANGLE; else with probability `log_fraction` its offset is scaled by a log-uniform factor in
+    [min_scale, 1]; with probability `near_start` it is a jittered benchmark start."""
+    k_near, k_jit, k_vel, k_log, k_scale, k_xy, k_th, k_rad, k_phi, k_goal, k_gr, k_gd, k_ga = jax.random.split(key, 13)
     log_scale = jnp.exp(jax.random.uniform(k_scale, minval=jnp.log(min_scale), maxval=0.0))
     scale = jnp.where(jax.random.bernoulli(k_log, log_fraction), log_scale, 1.0)
-    block_xy = BLOCK_XY_RANGE * scale * jax.random.uniform(k_xy, (2,), minval=-1.0, maxval=1.0)
-    theta = jnp.pi * scale * jax.random.uniform(k_th, (), minval=-1.0, maxval=1.0)
-    radius = jax.random.uniform(k_rad, (), minval=PUSHER_RADIUS_RANGE[0], maxval=PUSHER_RADIUS_RANGE[1])
-    phi = jax.random.uniform(k_phi, (), minval=-jnp.pi, maxval=jnp.pi)
-    pusher = block_xy + radius * jnp.array([jnp.cos(phi), jnp.sin(phi)]) - jnp.array([0.0, 0.1])
+    block_xy = block_range * scale * jax.random.uniform(k_xy, (2,), minval=-1.0, maxval=1.0)
+    theta = angle_range * scale * jax.random.uniform(k_th, (), minval=-1.0, maxval=1.0)
+    goal = jax.random.bernoulli(k_goal, goal_fraction)
+    goal_dist = jax.random.uniform(k_gr, (), minval=GOAL_RADIUS[0], maxval=goal_max)
+    goal_dir = jax.random.uniform(k_gd, (), minval=-jnp.pi, maxval=jnp.pi)
+    block_xy = jnp.where(goal, goal_dist * jnp.array([jnp.cos(goal_dir), jnp.sin(goal_dir)]), block_xy)
+    theta = jnp.where(goal, GOAL_ANGLE * jax.random.uniform(k_ga, (), minval=-1.0, maxval=1.0), theta)
+    pusher = place_pusher(k_rad, block_xy, theta, pusher_clearance, contact_prob)
     qpos_random = jnp.concatenate((block_xy, theta[None], pusher))
     qvel_random = QVEL_RANGE * jax.random.uniform(k_vel, (5,), minval=-1.0, maxval=1.0)
     qpos_start = START_QPOS + JITTER * jax.random.uniform(k_jit, (5,), minval=-1.0, maxval=1.0)
@@ -89,7 +127,8 @@ def ess_weights(costs, target_ess, log_prop=0.0, iters=40):
     return weights(log_t), jnp.exp(log_t)
 
 
-def make_batch_fn(ctrl, flow, cost, num_samples, near_start, log_fraction, min_scale, rollout_fraction, derive_samples):
+def make_batch_fn(ctrl, flow, cost, num_samples, near_start, log_fraction, min_scale, rollout_fraction, derive_samples, goal_fraction=0.0,
+                  state_kw=None):
     """-> (batch, idle). jitted batch(key, batch_size, sampler_params, uniform_fraction) -> contexts, unit
     candidates, costs, log proposal; idle(key, batch_size) -> cost of zero controls on batch's states.
     A `rollout_fraction` of the states are mid-rollout states: the state some random time into the best of
@@ -118,7 +157,7 @@ def make_batch_fn(ctrl, flow, cost, num_samples, near_start, log_fraction, min_s
 
     def draw_states(key, batch_size):
         k_state, k_roll, k_use = jax.random.split(key, 3)
-        states = jax.vmap(lambda k: sample_synthetic(k, task, near_start, log_fraction, min_scale))(jax.random.split(k_state, batch_size))
+        states = jax.vmap(lambda k: sample_synthetic(k, task, near_start, log_fraction, min_scale, goal_fraction, **(state_kw or {})))(jax.random.split(k_state, batch_size))
         if rollout_fraction > 0:
             qpos, qvel = jax.vmap(rollout_state)(states, jax.random.split(k_roll, batch_size))
             use = jax.random.bernoulli(k_use, rollout_fraction, (batch_size, 1))
@@ -168,7 +207,9 @@ def main(a):
 
     flow = ConditionalRealNVP(dim, context_dim, num_layers=a.layers, hidden_dim=a.hidden)
     batch_fn, idle_fn = make_batch_fn(ctrl, flow, a.cost, a.num_samples, a.near_start_prob, a.log_scale_fraction, a.min_scale,
-                                      a.rollout_fraction, a.derive_samples)
+                                      a.rollout_fraction, a.derive_samples, a.goal_fraction,
+                                      dict(block_range=a.block_range, angle_range=a.angle_range, pusher_clearance=a.pusher_clearance,
+                                           contact_prob=a.contact_prob, goal_max=a.goal_max))
     params = flow.init(jax.random.PRNGKey(a.seed))
     if a.init:  # continue from a trained flow (same --layers/--hidden)
         params = jax.tree_util.tree_map(jnp.asarray, load_pytree(params, Path(a.init) / "checkpoint.npz"))
@@ -186,6 +227,12 @@ def main(a):
     val_key = jax.random.PRNGKey(a.seed + 500)
     val_raw = batch_fn(val_key, a.val_size, params, 1.0)  # held-out states; uniform candidates (epoch 0 and the uniform-cost reference)
     val, uniform_cost = jax.block_until_ready(weigh(*val_raw)), float(val_raw[2].mean())
+    uniform_best = val_raw[2].min(axis=-1)  # best of the uniform candidates per validation state
+
+    def flow_scores(prm):  # flow-only candidates -> (mean cost, mean best-of-N, geo-mean best-of-N ratio vs uniform)
+        costs = batch_fn(val_key, a.val_size, prm, 0.0)[2]
+        best = costs.min(axis=-1)
+        return float(costs.mean()), float(best.mean()), float(jnp.exp(jnp.mean(jnp.log((best + 1e-4) / (uniform_best + 1e-4)))))
     idle_cost = float(idle_fn(val_key, a.val_size).mean())  # zero controls on the same validation states
 
     out = Path(a.output); out.mkdir(parents=True, exist_ok=True)
@@ -196,7 +243,11 @@ def main(a):
           f"uniform fraction {a.uniform_fraction} after {a.warmup_epochs} warm-up epoch(s)")
     print(f"epoch 0 (untrained) val loss {float(val_fn(params, *val)):.3f}")
 
-    best_cost, plateau_best, stale, early, lr = np.inf, np.inf, 0, 0, a.lr
+    best_ratio, plateau_best, stale, early, lr = np.inf, np.inf, 0, 0, a.lr
+    if a.init:  # the starting flow is the baseline to beat
+        best_ratio = plateau_best = flow_scores(params)[2]
+        save_pytree(params, out / "checkpoint.npz")
+        print(f"epoch 0 baseline best-of-{a.num_samples} ratio vs uniform {best_ratio:.3f}")
     key = jax.random.PRNGKey(a.seed + 1)
     for epoch in range(1, a.epochs + 1):
         losses = []
@@ -209,21 +260,21 @@ def main(a):
             params = optax.apply_updates(params, updates)
             losses.append(float(loss))
         v = float(val_fn(params, *weigh(*batch_fn(val_key, a.val_size, params, mix))))  # same recipe as train, held-out states
-        flow_cost = float(batch_fn(val_key, a.val_size, params, 0.0)[2].mean())  # flow-only candidates, same states
-        plateau_best, stale, lr, reduced = plateau_step(flow_cost, plateau_best, stale, lr, patience=3, factor=0.5,
-                                                         minimum=a.lr / 50, min_delta=0.05)
+        flow_cost, flow_best, ratio = flow_scores(params)
+        plateau_best, stale, lr, reduced = plateau_step(ratio, plateau_best, stale, lr, patience=a.lr_patience, factor=0.5,
+                                                         minimum=a.lr / 50, min_delta=0.01)
         opt_state.hyperparams["learning_rate"] = lr
-        improved = flow_cost < best_cost - 0.05
+        improved = ratio < best_ratio - 0.01
         if improved:
-            best_cost, early = flow_cost, 0
+            best_ratio, early = ratio, 0
             save_pytree(params, out / "checkpoint.npz")
         else:
             early += 1
-        print(f"epoch {epoch:3d} train {np.mean(losses):.3f} val {v:.3f} flow cost {flow_cost:.1f} (uniform {uniform_cost:.1f}, idle {idle_cost:.1f}) lr {lr:.1e}"
+        print(f"epoch {epoch:3d} train {np.mean(losses):.3f} val {v:.3f} best-of-{a.num_samples} {flow_best:.3f} (uniform {float(uniform_best.mean()):.3f}) ratio {ratio:.3f} | mean cost {flow_cost:.1f} (uniform {uniform_cost:.1f}, idle {idle_cost:.1f}) lr {lr:.1e}"
               f"{' (reduced)' if reduced else ''}{' (best)' if improved else ''}", flush=True)
-        if early >= 10:
+        if early >= a.stop_patience:
             print("early stopping"); break
-    print(f"best flow cost {best_cost:.1f}; saved {out / 'checkpoint.npz'}")
+    print(f"best ratio {best_ratio:.3f}; saved {out / 'checkpoint.npz'}")
 
 
 if __name__ == "__main__":
@@ -237,9 +288,16 @@ if __name__ == "__main__":
     p.add_argument("--near-start-prob", type=float, default=0.1, help="share of synthetic states that are jittered benchmark starts")
     p.add_argument("--log-scale-fraction", type=float, default=1 / 3, help="share of synthetic states with log-scaled (near-goal) block offset")
     p.add_argument("--min-scale", type=float, default=0.2, help="smallest block-offset scale for the log-scaled states")
+    p.add_argument("--goal-fraction", type=float, default=0.0, help="share of synthetic states with the block 1 cm to --goal-max from the goal at |angle| < 0.3")
+    p.add_argument("--block-range", type=float, default=BLOCK_XY_RANGE, help="block x,y drawn within this distance of the goal (m)")
+    p.add_argument("--angle-range", type=float, default=float(np.pi), help="block angle drawn within +-this (rad)")
+    p.add_argument("--pusher-clearance", type=float, default=0.10, help="pusher placed up to this far from the block surface (m)")
+    p.add_argument("--contact-prob", type=float, default=0.3, help="share of states with the pusher exactly touching the block")
     p.add_argument("--rollout-fraction", type=float, default=0.4, help="share of states taken mid-rollout of a good candidate")
     p.add_argument("--derive-samples", type=int, default=32, help="uniform candidates tried to find the rollout that gives a state")
     p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--lr-patience", type=int, default=5, help="epochs without ratio improvement before halving the lr")
+    p.add_argument("--stop-patience", type=int, default=15, help="epochs without ratio improvement before stopping")
     p.add_argument("--steps-per-epoch", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-samples", type=int, default=32)
@@ -247,6 +305,7 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--hidden", type=int, default=128)
+    p.add_argument("--goal-max", type=float, default=GOAL_RADIUS[1], help="largest block distance (m) of the --goal-fraction states")
     p.add_argument("--init", default=None, help="sampler dir whose checkpoint to start from (same --layers/--hidden)")
     p.add_argument("--seed", type=int, default=0)
     main(p.parse_args())
