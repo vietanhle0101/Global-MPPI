@@ -1,8 +1,8 @@
 <mujoco model="pusht">
-  <option timestep="0.01" iterations="1" ls_iterations="4" />
+  <option timestep="0.02" iterations="1" ls_iterations="4" />
 
   <default>
-    <velocity ctrllimited="true" ctrlrange="-1.0 1.0" kv="0.1"/>
+    <velocity ctrllimited="true" ctrlrange="-0.5 0.5" kv="0.1"/>
     <default class="goal">
       <geom conaffinity="0" contype="0" rgba="0 1 0 0.2"/>
     </default>

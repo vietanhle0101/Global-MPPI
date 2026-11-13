@@ -186,11 +186,20 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         f"{1000 * mj_model.opt.timestep:.0f} ms ({1.0 / mj_model.opt.timestep:.0f} Hz physics)."
     )
 
+    def sync_state(mjx_data: mjx.Data) -> mjx.Data:
+        """Copy the simulator state into the planner state, with the same
+        types at warm-up and in the loop so the jitted calls never retrace."""
+        return mjx_data.replace(
+            qpos=jnp.array(mj_data.qpos),
+            qvel=jnp.array(mj_data.qvel),
+            ctrl=jnp.array(mj_data.ctrl),
+            mocap_pos=jnp.array(mj_data.mocap_pos),
+            mocap_quat=jnp.array(mj_data.mocap_quat),
+            time=jnp.array(mj_data.time, jnp.float32),
+        )
+
     # Initialize the controller
-    mjx_data = mjx.put_data(mj_model, mj_data)
-    mjx_data = mjx_data.replace(
-        mocap_pos=mj_data.mocap_pos, mocap_quat=mj_data.mocap_quat
-    )
+    mjx_data = sync_state(mjx.put_data(mj_model, mj_data))
     policy_params = controller.init_params(initial_knots=initial_knots, seed=current_seed)
     jit_interp_func = jax.jit(controller.interp_func)
     
@@ -200,25 +209,13 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
     if controller.ctrl_name == "globalmppi":
         jit_ksos_rollout = jax.jit(controller.ksos_rollout)
-        policy_params = jit_ksos_rollout(mjx_data, policy_params)
-        policy_params = jit_ksos_rollout(mjx_data, policy_params)
-
-        jit_optimize = jax.jit(controller.optimize)
-        policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
-        policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
-        # rollout of the current mean, for the safeguards below
-        jit_mean_rollout = jax.jit(
-            lambda state, params: controller.rollout(state, params.tk, params.mean[None, ...])
-        )
-        jit_mean_rollout(mjx_data, policy_params)
-        # best KSOS candidate by plain rollout cost
-        def best_candidate(state, params):
-            rollouts = controller.rollout(state, params.tk, params.knots)
-            idx = jnp.argmin(rollouts.costs.sum(axis=1))
-            return params.knots[idx], jax.tree.map(lambda x: x[idx][None], rollouts)
-
-        jit_best_candidate = jax.jit(best_candidate)
-        jit_best_candidate(mjx_data, policy_params)
+        jit_safeguarded_optimize = jax.jit(controller.safeguarded_optimize)
+        # one full cycle, twice: the second sees the same argument types as the loop
+        for _ in range(2):
+            policy_params = jit_ksos_rollout(mjx_data, policy_params.replace(iter=0))
+            policy_params = controller.solve_ksos(policy_params)
+            policy_params = policy_params.replace(mean=policy_params.ksos_mean)
+            policy_params, *_ = jit_safeguarded_optimize(mjx_data, policy_params)
     else:
 
         jit_optimize = jax.jit(controller.optimize)
@@ -384,13 +381,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             start_time = time.time()
 
             # Set the start state for the controller
-            mjx_data = mjx_data.replace(
-                qpos=jnp.array(mj_data.qpos),
-                qvel=jnp.array(mj_data.qvel),
-                mocap_pos=jnp.array(mj_data.mocap_pos),
-                mocap_quat=jnp.array(mj_data.mocap_quat),
-                time=mj_data.time,
-            )
+            mjx_data = sync_state(mjx_data)
             robot_pos_history.append(np.array(mj_data.qpos))
             reached = goal_reached is not None and bool(goal_reached(mj_data))
 
@@ -519,26 +510,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         # 4. Time the MPPI local-search refinement
                         # ============================================================
                         mppi_start = time.perf_counter()
-                        # safeguard: use the best candidate if it beats the KSOS mean
-                        cand_knots, cand_best = jit_best_candidate(mjx_data, policy_params)
-                        ksos_best = jit_mean_rollout(mjx_data, policy_params)
-                        cand_cost = float(cand_best.costs.sum())
-                        ksos_cost = float(ksos_best.costs.sum())
-                        use_cand = cand_cost < ksos_cost
-                        if use_cand:
-                            policy_params = policy_params.replace(mean=cand_knots)
-                            ksos_best = cand_best
-                        ksos_mean = policy_params.mean
-                        policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
-                        policy_params = jax.block_until_ready(policy_params)
+                        policy_params, rollouts, best_cost, pass_costs = jit_safeguarded_optimize(
+                            mjx_data, policy_params
+                        )
+                        pass_cost_log.append(tuple(x.item() for x in pass_costs))
                         mppi_time = time.perf_counter() - mppi_start
-                        # safeguard: keep the pre-MPPI plan if MPPI made it worse
-                        mppi_cost = float(rollouts_best.costs.sum())
-                        keep_ksos = mppi_cost > float(ksos_best.costs.sum())
-                        if keep_ksos:
-                            policy_params = policy_params.replace(mean=ksos_mean)
-                            rollouts_best = ksos_best
-                        pass_cost_log.append((cand_cost, ksos_cost, mppi_cost, use_cand, keep_ksos))
 
                         iter_total_time = time.perf_counter() - iter_start_time
 
@@ -577,7 +553,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         )
             else:
                 policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
-            
+                best_cost = rollouts_best.costs.sum()  # cost of the returned mean
+
             # ============================================================
             # Save total timing over all restarts / iterations
             # (only globalmppi populates these timing variables)
@@ -608,10 +585,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                     f"total_mppi={total_mppi_time:.3f}s, "
                     f"total_all={total_all_time:.3f}s"
                 )
-            # data logging: rollouts_best (from jit_optimize) is already the
-            # rollout of params.mean, so its summed cost is the "best cost" -
-            # no need to re-roll-out via get_cost_with_best_samples.
-            best_cost = rollouts_best.costs.sum()
             if controller.ctrl_name == "globalmppi":
                 best_cost_history.append(best_cost)
                 error_history.append(best_sample_cost - best_cost)

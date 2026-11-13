@@ -27,6 +27,7 @@ class GlobalMPPIParams(SamplingParams):
     iter: jax.Array
     lse_cost: jax.Array
     cost: jax.Array
+    cand_cost: jax.Array  # plain (unsmoothed) total cost of each KSOS candidate
     knots: jax.Array
     ksos_mean: jax.Array
     ksos_result_cost: jax.Array
@@ -150,8 +151,8 @@ class GlobalMPPI(SamplingBasedController):
         lse_cost = jnp.array(0.0)
         cost = jnp.array(0.0)
         ksos_mean = jnp.zeros_like(_params.mean)
-        ksos_result_cost = jnp.array(0.0)
-        return GlobalMPPIParams(tk=_params.tk, mean=_params.mean, rng=_params.rng, iter=iter, lse_cost=lse_cost, cost = cost, ksos_mean=ksos_mean, ksos_result_cost = ksos_result_cost, knots=None, best_cost= _params.best_cost, ksos_trace=None,best_trace=_params.best_trace)
+        ksos_result_cost = jnp.zeros((), jnp.float32)
+        return GlobalMPPIParams(tk=_params.tk, mean=_params.mean, rng=_params.rng, iter=iter, lse_cost=lse_cost, cost = cost, cand_cost=cost, ksos_mean=ksos_mean, ksos_result_cost = ksos_result_cost, knots=None, best_cost= _params.best_cost, ksos_trace=None,best_trace=_params.best_trace)
 
     def sample_knots(self, params: GlobalMPPIParams) -> Tuple[jax.Array, GlobalMPPIParams]:
         """Sample MPPI candidate knots as Gaussian noise around the current
@@ -301,7 +302,7 @@ class GlobalMPPI(SamplingBasedController):
         _, rollouts = self.eval_rollouts(self.model, state, controls, knots)
         costs = jnp.sum(rollouts.costs, axis=1)  # sum over time steps
 
-        return params.replace(knots= knots, lse_cost=costs, cost = rollouts.costs, ksos_trace=rollouts.trace_sites)
+        return params.replace(knots= knots, lse_cost=costs, cand_cost=costs, cost = rollouts.costs, ksos_trace=rollouts.trace_sites)
     
     def lse_smoothing_rollout(
         self,
@@ -323,10 +324,12 @@ class GlobalMPPI(SamplingBasedController):
         tq = jnp.linspace(tk[0], tk[-1], self.ctrl_steps)
         num_rollouts, num_lse, num_knots, nu = lse_knots.shape
 
-        flat_knots = lse_knots.reshape(num_rollouts * num_lse, num_knots, nu)
+        # the candidates themselves go in the same batch, for their plain costs
+        flat_knots = jnp.concatenate([knots, lse_knots.reshape(num_rollouts * num_lse, num_knots, nu)])
         flat_controls = self.interp_func(tq, tk, flat_knots)  # (num_rollouts, H, nu)
         _, flat_rollouts = self.eval_rollouts(self.model, state, flat_controls, flat_knots)
-        total_costs = flat_rollouts.costs.reshape(num_rollouts, num_lse, flat_rollouts.costs.shape[1])
+        cand_costs = jnp.sum(flat_rollouts.costs[:num_rollouts], axis=-1)
+        total_costs = flat_rollouts.costs[num_rollouts:].reshape(num_rollouts, num_lse, flat_rollouts.costs.shape[1])
         
         # sum cost over time steps
         sum_costs = jnp.sum(total_costs, axis=-1)  # sum over time steps
@@ -335,7 +338,7 @@ class GlobalMPPI(SamplingBasedController):
         sum = jnp.mean(samples_exp, axis=1, keepdims=True)
         lse_cost = - jnp.log(sum) * self.lse_lambda + min_costs
 
-        return params.replace(knots= knots, cost = total_costs, lse_cost=lse_cost.squeeze())
+        return params.replace(knots= knots, cost = total_costs, cand_cost=cand_costs, lse_cost=lse_cost.squeeze())
     
     def ksos_rollout(self, state: mjx.Data, params: Any) -> Any:
         """Warm-start the spline knot times to the current sim time, sample a
@@ -444,9 +447,10 @@ class GlobalMPPI(SamplingBasedController):
             print(f"KSOS solver failed: {error}")
             return params
 
+        # device arrays, so the jitted calls that take params never recompile
         return params.replace(
-            ksos_mean=updated_knots,
-            ksos_result_cost=info["cost"],
+            ksos_mean=jnp.asarray(updated_knots),
+            ksos_result_cost=jnp.asarray(info["cost"], jnp.float32),
         )
 
     def update_params(
@@ -462,5 +466,27 @@ class GlobalMPPI(SamplingBasedController):
         # N.B. jax.nn.softmax takes care of details like baseline subtraction.
         weights = jax.nn.softmax(-costs / self.temperature, axis=0)
         mppi_mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
-        
+
         return params.replace(mean=mppi_mean)
+
+    def safeguarded_optimize(
+        self, state: mjx.Data, params: GlobalMPPIParams
+    ) -> Tuple[GlobalMPPIParams, Trajectory, jax.Array, Tuple[jax.Array, ...]]:
+        """MPPI refinement of the KSOS mean (params.mean), with two safeguards:
+        start from the best KSOS candidate if it beats the KSOS mean, and keep
+        that start if MPPI makes it worse. Returns the updated params, the MPPI
+        rollouts, the cost of the returned mean, and the costs and decisions
+        (candidate, KSOS mean, MPPI, used candidate, kept start) for logging."""
+        idx = jnp.argmin(params.cand_cost)
+        cand_cost = params.cand_cost[idx]
+        ksos_cost = self.rollout(state, params.tk, params.mean[None]).costs.sum()
+        use_cand = cand_cost < ksos_cost
+        start = jnp.where(use_cand, params.knots[idx], params.mean)
+        start_cost = jnp.minimum(cand_cost, ksos_cost)
+
+        params, rollouts, rollouts_best = self.optimize(state, params.replace(mean=start))
+        mppi_cost = rollouts_best.costs.sum()
+        keep = mppi_cost > start_cost
+        params = params.replace(mean=jnp.where(keep, start, params.mean))
+        best_cost = jnp.minimum(mppi_cost, start_cost)
+        return params, rollouts, best_cost, (cand_cost, ksos_cost, mppi_cost, use_cand, keep)

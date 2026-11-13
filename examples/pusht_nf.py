@@ -31,9 +31,8 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "--wandb",
     action=argparse.BooleanOptionalAction,
-    default=True,
-    help="Log best_cost_history to Weights & Biases "
-    "(on by default; use --no-wandb to disable)",
+    default=False,
+    help="Log best_cost_history to Weights & Biases (off by default)",
 )
 parser.add_argument(
     "--ksos-solver",
@@ -143,8 +142,8 @@ parser.add_argument(
 parser.add_argument(
     "--duration",
     type=float,
-    default=20.0,
-    help="Episode length in simulated seconds (default: 20)",
+    default=10.0,
+    help="Episode length in simulated seconds (default: 10, i.e. 500 steps at 50 Hz)",
 )
 parser.add_argument(
     "--goal-pos-tol",

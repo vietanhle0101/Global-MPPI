@@ -33,7 +33,7 @@ from .train_sampler import plateau_step
 
 START_QPOS = jnp.array([0.1, 0.1, 1.3, 0.0, 0.0])  # examples/pusht.py
 JITTER = jnp.array([0.03, 0.03, 0.3, 0.03, 0.03])
-QVEL_RANGE = jnp.array([0.3, 0.3, 0.3, 0.8, 0.8])
+QVEL_RANGE = jnp.array([0.3, 0.3, 0.3, 0.5, 0.5])
 
 
 def sample_state(key, task):

@@ -89,7 +89,8 @@ global_mppi/
 ├── alg_base.py    # Abstract SamplingBasedController base class
 ├── task_base.py   # Abstract Task interface
 └── risk.py        # Domain-randomization risk strategies (average, worst-case, CVaR, ...)
-examples/          # Runnable scripts: pusht.py, cube.py
+examples/          # Runnable scripts: pusht.py, pusht_nf.py, cube.py
+ksos_l2o/          # Learned KSOS sampler (normalizing flow) for PushT
 tests/             # pytest test suite
 data/logs/         # Example best-cost-history logs + plotting script
 ksos-tools/        # KernelSOS solver (git submodule)
@@ -138,6 +139,90 @@ Pass `--wandb-entity` (or set `export WANDB_ENTITY=<your-entity>`) if your W&B
 account has no default entity, otherwise `wandb.init` errors with
 `entity not specified`. The first run prompts for your API key (from
 https://wandb.ai/authorize) and caches it in `~/.netrc`.
+
+## Learned KSOS sampler (normalizing flow)
+
+`ksos_l2o/` trains a state-conditioned normalizing flow (RealNVP) that
+proposes GlobalMPPI's KSOS candidates for PushT, in place of uniform or Sobol
+samples. `examples/pusht_nf.py` runs GlobalMPPI with it.
+
+### Training
+
+Train on near-goal states with the LSE-smoothed cost. These are the settings
+of the current model, `ksos_l2o/data/sampler_lse_20ms`:
+
+```bash
+PYTHONPATH=. python -m ksos_l2o.train_state_sampler \
+  --output ksos_l2o/data/sampler_lse_20ms \
+  --cost lse --sigma-lse 0.1 --layers 8 --hidden 256 \
+  --goal-fraction 1.0 --goal-max 0.15 --near-start-prob 0 --rollout-fraction 0 \
+  --pusher-clearance 0.05 --epochs 50 --steps-per-epoch 100 --batch-size 64 --val-size 128
+```
+
+Each epoch logs the flow's best-of-32 candidate cost, divided by the same
+figure for 32 uniform candidates (`ratio`; lower is better). The learning
+rate halves after `--lr-patience` epochs without improvement of at least
+0.01, and training stops after `--stop-patience` such epochs. The checkpoint
+with the best ratio is saved to `--output`.
+
+To fine-tune an existing model, pass `--init <dir>`. The `--layers` and
+`--hidden` values must match that model. The starting model is scored and
+saved first, so use a new `--output` to avoid overwriting it:
+
+```bash
+PYTHONPATH=. python -m ksos_l2o.train_state_sampler \
+  --init ksos_l2o/data/sampler_lse_20ms --output ksos_l2o/data/sampler_plain_20ms \
+  --cost plain --layers 8 --hidden 256 --lr 5e-4 \
+  --goal-fraction 1.0 --goal-max 0.15 --near-start-prob 0 --rollout-fraction 0 \
+  --pusher-clearance 0.05 --epochs 20 --steps-per-epoch 100 --batch-size 64 --val-size 128
+```
+
+A trained model is only valid for the physics, control range and cost it was
+trained with. Retrain after changing `global_mppi/models/pusht/pusht.xml` or
+the PushT cost.
+
+### Testing
+
+```bash
+# NF sampler, default start
+PYTHONPATH=. python examples/pusht_nf.py --seeds 0 \
+  --ksos-sampling flow --ksos-flow-dir ksos_l2o/data/sampler_lse_20ms
+
+# NF sampler, block started close to the goal
+PYTHONPATH=. python examples/pusht_nf.py --seeds 0 \
+  --ksos-sampling flow --ksos-flow-dir ksos_l2o/data/sampler_lse_20ms --near-goal-init
+
+# Baselines: same commands with --ksos-sampling uniform or sobol (no --ksos-flow-dir)
+PYTHONPATH=. python examples/pusht_nf.py --seeds 0 --ksos-sampling uniform --near-goal-init
+```
+
+Useful flags:
+
+- `--seeds 0,1,2`: run several episodes (the default is seeds 0–5).
+- `--duration 10`: episode length in seconds (the default, 500 steps at
+  50 Hz). `--cycles N` sets the number of steps directly.
+- `--goal-pos-tol` / `--goal-angle-tol`: the episode ends once the block is
+  within 5 mm and 0.05 rad of the goal (by default). `--goal-pos-tol 0`
+  turns this off.
+- `--random-init` / `--init-qpos x,y,theta,px,py`: other start states.
+- `--ksos-num-samples 128 --elite-num 32`: more flow candidates (default 32).
+  This reaches the goal faster from close starts, at a higher cost per cycle.
+- `--ksos-cost plain`: score KSOS candidates with one rollout each instead of
+  the LSE-smoothed cost (100 perturbed rollouts each), which is faster.
+- `--no-headless`: open the viewer instead of recording a video.
+- `--wandb`: log to Weights & Biases (off by default).
+
+The output for each run (cost history and video) goes to
+`logs/pushT_globalmppi_globalmppi/<timestamp>/`. Each control cycle prints its
+timing and the safeguard decisions:
+
+- `used best candidate`: the best KSOS candidate beat the KSOS solution and
+  seeded MPPI instead.
+- `kept pre-MPPI plan`: MPPI made the plan worse, so it was discarded.
+
+To run two JAX jobs on one GPU (for example training and testing), start them
+with `XLA_PYTHON_CLIENT_PREALLOCATE=false`. Otherwise each job reserves 75% of
+GPU memory at startup.
 
 ## Running the tests
 
