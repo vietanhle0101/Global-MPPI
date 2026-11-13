@@ -1,17 +1,8 @@
-"""Context-conditioned RealNVP sampler.
+"""Conditional RealNVP over a box [lb, ub]:
 
-    z ~ N(0, I)  -->  y = F_phi(z; c)  -->  x = lb + (ub - lb) * sigmoid(y)
+    z ~ N(0, I),  y = F(z; c),  x = lb + (ub - lb) * sigmoid(y)
 
-``F_phi`` is a stack of affine coupling layers conditioned on a context
-vector ``c``; ``x`` always lands inside ``[lb, ub]`` by construction. Both
-directions are available: :meth:`sample` draws ``x`` from ``z``,
-:meth:`log_prob` scores an existing ``x`` -- the one used to train against
-already-logged candidate knots.
-
-Problem-agnostic: ``dim`` is whatever is being sampled (for PushT, the
-flattened ``num_knots * nu`` knot vector) and ``context_dim`` is whatever the
-context builder produces. Pure float32; this module never touches
-``jax_enable_x64``.
+F is a stack of affine coupling layers conditioned on the context c.
 """
 from typing import Tuple
 
@@ -22,12 +13,9 @@ Params = dict
 
 
 def coupling_masks(dim: int, num_layers: int) -> jax.Array:
-    """``(num_layers, dim)`` 0/1 masks; 1 = coordinate passed through
-    unchanged by that layer. Cycles even/odd, odd/even, lower-half,
-    upper-half (period 4), so every coordinate is both transformed and used
-    as a conditioner input, by different partner coordinates."""
-    if dim < 2:
-        raise ValueError("affine coupling needs dim >= 2")
+    """0/1 masks, shape (num_layers, dim), 1 = passed through unchanged.
+    Cycles through even/odd, odd/even, first half, second half."""
+    assert dim >= 2
     index = jnp.arange(dim)
     patterns = jnp.stack(
         [index % 2 == 0, index % 2 == 1, index < dim // 2, index >= dim // 2]
@@ -51,9 +39,8 @@ def _apply(layer: Params, x: jax.Array) -> jax.Array:
 def init_flow(
     key: jax.Array, dim: int, context_dim: int, num_layers: int, hidden_dim: int
 ) -> Params:
-    """One conditioner MLP ``[z * mask, c] -> (scale_raw, shift)`` per layer.
-    The output layer starts at zero, so the untrained flow is the identity."""
-    coupling_masks(dim, num_layers)  # validates dim >= 2
+    """One MLP [z * mask, c] -> (scale, shift) per layer. The last layer is
+    zero-initialized, so the flow starts as the identity."""
     layers = []
     for layer_key in jax.random.split(key, num_layers):
         k1, k2 = jax.random.split(layer_key)
@@ -81,7 +68,7 @@ def _scale_shift(
 def flow_forward(
     params: Params, z: jax.Array, context: jax.Array, scale_bound: float = 2.0
 ) -> Tuple[jax.Array, jax.Array]:
-    """``y = F(z; c)`` and ``log|det dF/dz|`` for one point ``z``, shape ``(dim,)``."""
+    """y = F(z; c) and log|det dF/dz| for a single z of shape (dim,)."""
     masks = coupling_masks(z.shape[-1], len(params["layers"]))
     logdet = jnp.zeros((), dtype=z.dtype)
     for layer, mask in zip(params["layers"], masks):
@@ -94,7 +81,7 @@ def flow_forward(
 def flow_inverse(
     params: Params, y: jax.Array, context: jax.Array, scale_bound: float = 2.0
 ) -> Tuple[jax.Array, jax.Array]:
-    """``z = F^{-1}(y; c)`` and ``log|det dF^{-1}/dy|`` for one point."""
+    """z = F^-1(y; c) and log|det dF^-1/dy|."""
     masks = coupling_masks(y.shape[-1], len(params["layers"]))
     logdet = jnp.zeros((), dtype=y.dtype)
     for layer, mask in reversed(list(zip(params["layers"], masks))):
@@ -105,7 +92,7 @@ def flow_inverse(
 
 
 def _box_logdet(y: jax.Array, lb: jax.Array, ub: jax.Array) -> jax.Array:
-    """``log|det dx/dy|`` of ``x = lb + (ub - lb) * sigmoid(y)``."""
+    # log|det dx/dy| of x = lb + (ub - lb) * sigmoid(y)
     return jnp.sum(jnp.log(ub - lb) + jax.nn.log_sigmoid(y) + jax.nn.log_sigmoid(-y))
 
 
@@ -114,13 +101,7 @@ def _log_normal(z: jax.Array) -> jax.Array:
 
 
 class ConditionalRealNVP:
-    """A context-conditioned RealNVP sampler over a box ``[lb, ub]^dim``.
-
-    ``dim`` and ``context_dim`` make this problem-agnostic; ``lb``/``ub``
-    (box bounds) are passed per call, not stored, since they may depend on
-    where the sampler is used (for PushT, the fixed ``+/- u_max`` box of
-    GlobalMPPI's pass 0).
-    """
+    """Conditional RealNVP sampler. The box bounds lb, ub are passed per call."""
 
     def __init__(
         self,
@@ -148,7 +129,7 @@ class ConditionalRealNVP:
     def sample(
         self, params: Params, z: jax.Array, context: jax.Array, lb: jax.Array, ub: jax.Array
     ) -> Tuple[jax.Array, jax.Array]:
-        """One latent ``z`` (shape ``(dim,)``) -> ``(x, log q(x|c))``."""
+        """Map one latent z to (x, log q(x | c))."""
         y, logdet = self.forward(params, z, context)
         x = lb + (ub - lb) * jax.nn.sigmoid(y)
         return x, _log_normal(z) - logdet - _box_logdet(y, lb, ub)
@@ -157,7 +138,7 @@ class ConditionalRealNVP:
         self, params: Params, x: jax.Array, context: jax.Array, lb: jax.Array, ub: jax.Array,
         eps: float = 1e-6,
     ) -> jax.Array:
-        """``log q(x|c)`` of a box point ``x`` (inverse of :meth:`sample`)."""
+        """log q(x | c) of a point x in the box."""
         u = jnp.clip((x - lb) / (ub - lb), eps, 1.0 - eps)
         y = jnp.log(u) - jnp.log1p(-u)
         z, logdet = self.inverse(params, y, context)
@@ -166,8 +147,7 @@ class ConditionalRealNVP:
     def sample_batch(
         self, params: Params, z: jax.Array, contexts: jax.Array, lb: jax.Array, ub: jax.Array
     ) -> Tuple[jax.Array, jax.Array]:
-        """``z``: ``(B, N, dim)``, ``contexts``: ``(B, context_dim)`` ->
-        ``x``: ``(B, N, dim)``, ``log_q``: ``(B, N)``."""
+        """z: (B, N, dim), contexts: (B, context_dim) -> x (B, N, dim), log_q (B, N)."""
         per_point = jax.vmap(self.sample, in_axes=(None, 0, None, None, None))
         per_context = jax.vmap(per_point, in_axes=(None, 0, 0, None, None))
         return per_context(params, z, contexts, lb, ub)
@@ -175,7 +155,7 @@ class ConditionalRealNVP:
     def log_prob_batch(
         self, params: Params, x: jax.Array, contexts: jax.Array, lb: jax.Array, ub: jax.Array
     ) -> jax.Array:
-        """``x``: ``(B, N, dim)``, ``contexts``: ``(B, context_dim)`` -> ``(B, N)``."""
+        """x: (B, N, dim), contexts: (B, context_dim) -> (B, N)."""
         per_point = jax.vmap(self.log_prob, in_axes=(None, 0, None, None, None))
         per_context = jax.vmap(per_point, in_axes=(None, 0, 0, None, None))
         return per_context(params, x, contexts, lb, ub)

@@ -84,7 +84,7 @@ class Task(ABC):
         pass
 
     def control_rate_cost(self, du: jax.Array) -> jax.Array:
-        """Cost of the control change du = uₜ - uₜ₋₁ between steps (default: none)."""
+        """The cost of changing the control by du = uₜ - uₜ₋₁ (zero by default)."""
         return 0.0
 
     def get_trace_sites(self, state: mjx.Data) -> jax.Array:

@@ -27,7 +27,7 @@ class GlobalMPPIParams(SamplingParams):
     iter: jax.Array
     lse_cost: jax.Array
     cost: jax.Array
-    cand_cost: jax.Array  # plain (unsmoothed) total cost of each KSOS candidate
+    cand_cost: jax.Array  # cost of each KSOS candidate without smoothing
     knots: jax.Array
     ksos_mean: jax.Array
     ksos_result_cost: jax.Array
@@ -79,10 +79,8 @@ class GlobalMPPI(SamplingBasedController):
                          Defaults to "zero" (zero-order hold).
             num_knots: The number of knots in the control spline.
             iterations: The number of optimization iterations to perform.
-            ksos_flow_sampler: For ksos_sampling="flow": a jittable callable
-                (state, key, n) -> (n, num_knots, nu) candidate knots, used for
-                pass 0 of the KSOS solve; later passes sample uniformly in the
-                shrinking trust region, as in ksos_sampling="uniform".
+            ksos_flow_sampler: (state, key, n) -> knots of shape (n, num_knots, nu).
+                Used for the first KSOS pass when ksos_sampling="flow".
         """
         super().__init__(
             task,
@@ -103,11 +101,8 @@ class GlobalMPPI(SamplingBasedController):
         # lse parameters
         self.lse_num_samples = 100
         self.lse_smoothing_sigma = jnp.array([0.3, 0.2, 0.1, 0.05, 0.001])
-        # MPPI refinement noise per pass; defaults to the LSE schedule but can be
-        # set separately (e.g. when pass 0 uses a flow trained at a tiny sigma)
-        self.mppi_noise = self.lse_smoothing_sigma
-        # KSOS candidate 0 = previous plan shifted to the current time
-        self.ksos_warm_start = False
+        self.mppi_noise = self.lse_smoothing_sigma  # MPPI noise per pass
+        self.ksos_warm_start = False  # add the shifted previous plan as a KSOS candidate
         self.lse_lambda = 0.1
 
         # ksos parameters
@@ -121,19 +116,12 @@ class GlobalMPPI(SamplingBasedController):
         self.ksos_linesearch = True
         self.ksos_num_restart = 5
         self.ksos_solver = ksos_solver
-        if ksos_sampling == "flow" and ksos_flow_sampler is None:
-            raise ValueError("ksos_sampling='flow' needs a ksos_flow_sampler")
-        if ksos_sampling not in KSOS_SAMPLING_MODES:
-            raise ValueError(
-                f"Unknown ksos_sampling mode: {ksos_sampling!r} "
-                f"(expected one of {KSOS_SAMPLING_MODES})"
-            )
+        assert ksos_sampling in KSOS_SAMPLING_MODES, f"unknown ksos_sampling: {ksos_sampling}"
+        assert ksos_sampling != "flow" or ksos_flow_sampler is not None, "flow sampling needs ksos_flow_sampler"
         self.ksos_sampling = ksos_sampling
         self.ksos_flow_sampler = ksos_flow_sampler
         if self.ksos_sampling == "sobol":
-            # Precomputed once (outside jit) since scipy's QMC sampler isn't
-            # traceable; `sample_ksos_knots` only does elementwise jax ops on
-            # this fixed unit-cube point set.
+            # scipy's Sobol can't be jitted, so draw the points once here
             dim = num_knots * task.model.nu
             sampler = qmc.Sobol(d=dim, scramble=True, seed=seed)
             self.sobol_unit = jnp.asarray(sampler.random(self.ksos_num_samples))
@@ -170,9 +158,7 @@ class GlobalMPPI(SamplingBasedController):
         )
         sigma = self.mppi_noise[params.iter]
         controls = params.mean + sigma * noise
-        # sample 0 = unperturbed mean
-        controls = controls.at[0].set(params.mean)
-        # jax.debug.print("sigma: {}", sigma)
+        controls = controls.at[0].set(params.mean)  # keep the mean itself as a sample
 
         return controls, params.replace(rng=rng)
 
@@ -184,9 +170,8 @@ class GlobalMPPI(SamplingBasedController):
         previous KSOS mean (or zero on the first iteration) whose radius
         shrinks geometrically with `decay_rate` each iteration. The sampling
         distribution is controlled by `self.ksos_sampling`
-        ("linspace", "uniform", "gaussian", "sobol", or "flow"; "flow" draws
-        pass 0 from `ksos_flow_sampler(state, ...)` and the later passes
-        uniformly in the trust region)."""
+        ("linspace", "uniform", "gaussian", "sobol", or "flow"). With "flow",
+        only the first pass uses the flow, later passes are uniform."""
         rng, sample_rng = jax.random.split(params.rng)
 
         center = lax.cond(
@@ -221,18 +206,14 @@ class GlobalMPPI(SamplingBasedController):
                 maxval=center + radius,
             )
         elif self.ksos_sampling == "flow":
-            if state is None:
-                raise ValueError("ksos_sampling='flow' needs the state")
             shape = (self.ksos_num_samples, self.num_knots, self.task.model.nu)
             flow_rng = jax.random.fold_in(sample_rng, 1)
             ksos_knots = lax.cond(
                 jnp.equal(params.iter, 0),
-                lambda _: self.ksos_flow_sampler(state, flow_rng, self.ksos_num_samples).astype(params.mean.dtype),
-                lambda _: jax.random.uniform(
-                    sample_rng, shape, minval=center - radius, maxval=center + radius
-                ).astype(params.mean.dtype),
+                lambda _: self.ksos_flow_sampler(state, flow_rng, self.ksos_num_samples),
+                lambda _: jax.random.uniform(sample_rng, shape, minval=center - radius, maxval=center + radius),
                 operand=None,
-            )
+            ).astype(params.mean.dtype)
         elif self.ksos_sampling == "gaussian":
             noise = jax.random.normal(
                 sample_rng,
@@ -324,7 +305,7 @@ class GlobalMPPI(SamplingBasedController):
         tq = jnp.linspace(tk[0], tk[-1], self.ctrl_steps)
         num_rollouts, num_lse, num_knots, nu = lse_knots.shape
 
-        # the candidates themselves go in the same batch, for their plain costs
+        # roll out the candidates too (first num_rollouts entries), to get their plain cost
         flat_knots = jnp.concatenate([knots, lse_knots.reshape(num_rollouts * num_lse, num_knots, nu)])
         flat_controls = self.interp_func(tq, tk, flat_knots)  # (num_rollouts, H, nu)
         _, flat_rollouts = self.eval_rollouts(self.model, state, flat_controls, flat_knots)
@@ -447,7 +428,7 @@ class GlobalMPPI(SamplingBasedController):
             print(f"KSOS solver failed: {error}")
             return params
 
-        # device arrays, so the jitted calls that take params never recompile
+        # jnp arrays, numpy ones here make the jitted functions recompile
         return params.replace(
             ksos_mean=jnp.asarray(updated_knots),
             ksos_result_cost=jnp.asarray(info["cost"], jnp.float32),
@@ -472,21 +453,23 @@ class GlobalMPPI(SamplingBasedController):
     def safeguarded_optimize(
         self, state: mjx.Data, params: GlobalMPPIParams
     ) -> Tuple[GlobalMPPIParams, Trajectory, jax.Array, Tuple[jax.Array, ...]]:
-        """MPPI refinement of the KSOS mean (params.mean), with two safeguards:
-        start from the best KSOS candidate if it beats the KSOS mean, and keep
-        that start if MPPI makes it worse. Returns the updated params, the MPPI
-        rollouts, the cost of the returned mean, and the costs and decisions
-        (candidate, KSOS mean, MPPI, used candidate, kept start) for logging."""
-        idx = jnp.argmin(params.cand_cost)
-        cand_cost = params.cand_cost[idx]
+        """Run MPPI starting from the KSOS mean, or from the best KSOS candidate
+        if that one is cheaper. If MPPI makes the plan worse, keep the start.
+
+        Returns:
+            Updated params, MPPI rollouts, cost of the final mean, and
+            (candidate cost, KSOS cost, MPPI cost, used candidate, kept start)
+            for printing.
+        """
+        best = jnp.argmin(params.cand_cost)
+        cand_cost = params.cand_cost[best]
         ksos_cost = self.rollout(state, params.tk, params.mean[None]).costs.sum()
         use_cand = cand_cost < ksos_cost
-        start = jnp.where(use_cand, params.knots[idx], params.mean)
+        start = jnp.where(use_cand, params.knots[best], params.mean)
         start_cost = jnp.minimum(cand_cost, ksos_cost)
 
         params, rollouts, rollouts_best = self.optimize(state, params.replace(mean=start))
         mppi_cost = rollouts_best.costs.sum()
         keep = mppi_cost > start_cost
         params = params.replace(mean=jnp.where(keep, start, params.mean))
-        best_cost = jnp.minimum(mppi_cost, start_cost)
-        return params, rollouts, best_cost, (cand_cost, ksos_cost, mppi_cost, use_cand, keep)
+        return params, rollouts, jnp.minimum(mppi_cost, start_cost), (cand_cost, ksos_cost, mppi_cost, use_cand, keep)

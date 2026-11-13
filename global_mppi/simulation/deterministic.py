@@ -186,9 +186,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         f"{1000 * mj_model.opt.timestep:.0f} ms ({1.0 / mj_model.opt.timestep:.0f} Hz physics)."
     )
 
+    # copy the sim state to the planner. Use this everywhere, also for the
+    # warm-up, otherwise the input types differ and jax retraces at step 0
     def sync_state(mjx_data: mjx.Data) -> mjx.Data:
-        """Copy the simulator state into the planner state, with the same
-        types at warm-up and in the loop so the jitted calls never retrace."""
         return mjx_data.replace(
             qpos=jnp.array(mj_data.qpos),
             qvel=jnp.array(mj_data.qvel),
@@ -210,7 +210,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     if controller.ctrl_name == "globalmppi":
         jit_ksos_rollout = jax.jit(controller.ksos_rollout)
         jit_safeguarded_optimize = jax.jit(controller.safeguarded_optimize)
-        # one full cycle, twice: the second sees the same argument types as the loop
+        # run a full cycle twice, the second call gets the same types as in the loop
         for _ in range(2):
             policy_params = jit_ksos_rollout(mjx_data, policy_params.replace(iter=0))
             policy_params = controller.solve_ksos(policy_params)
@@ -263,9 +263,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     )
     os.makedirs(run_log_dir, exist_ok=True)
 
-    # Opt-in L2S (learned-sampler) raw data directory: one .npz per
-    # (seed, cycle) with every KSOS pass of that cycle, used offline to train
-    # the flow sampler. Off by default; does not affect the RNG stream.
+    # KSOS data for training the sampler, one .npz per (seed, cycle)
     if log_l2s:
         l2s_log_dir = os.path.join(
             repo_root,
@@ -418,8 +416,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         policy_params = policy_params.replace(iter=iter)
 
                         if log_l2s:
-                            # Mirror sample_ksos_knots' center/radius exactly,
-                            # for logging only (reads params, no RNG use).
+                            # same trust region as in sample_ksos_knots
                             center = (
                                 np.zeros_like(np.asarray(policy_params.ksos_mean))
                                 if iter == 0
@@ -437,9 +434,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         ksos_rollout_time = time.perf_counter() - ksos_rollout_start
 
                         if log_l2s:
-                            # Elite ranking must be captured here: solve_ksos
-                            # below overwrites params.lse_cost with the
-                            # filtered elite subset.
                             l2s_knots.append(np.asarray(policy_params.knots))
                             l2s_lse_cost.append(np.asarray(policy_params.lse_cost))
                             l2s_cost_summed.append(
@@ -553,7 +547,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         )
             else:
                 policy_params, rollouts, rollouts_best = jit_optimize(mjx_data, policy_params)
-                best_cost = rollouts_best.costs.sum()  # cost of the returned mean
+                best_cost = rollouts_best.costs.sum()
 
             # ============================================================
             # Save total timing over all restarts / iterations
@@ -604,7 +598,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # cost evaulation
             if cycle_count % 10 == 0 or cycle_count >= max_cycles or reached:
-                # print(f"Cost for optimal action (step {cycle_count}): {best_cost_history}")
                     # If we collected any cost history during the interactive run, save a plot.
                 if (
                     'best_cost_history' in locals()

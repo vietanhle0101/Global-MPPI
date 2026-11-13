@@ -1,9 +1,5 @@
-"""Load and sample the state-conditioned flow trained by train_state_sampler.py.
-
-The flow models u = (knots - lb) / (ub - lb) in [0, 1]^dim over the full control
-box, conditioned on the PushT state context; samples are mapped back through the
-runtime bounds.
-"""
+"""Load the flow trained by train_state_sampler.py and sample knots from it.
+The flow works in the unit box, samples are scaled to the control bounds."""
 import json
 from pathlib import Path
 
@@ -24,14 +20,14 @@ def load_state_sampler(sampler_dir):
 
 
 def sample(flow, params, z, context, lb, ub):
-    """`z` (N, dim), `context` (context_dim,), `lb`/`ub` (dim,) -> knots (N, dim) inside [lb, ub]."""
+    """z: (N, dim), context: (context_dim,) -> knots (N, dim) in [lb, ub]."""
     unit, _ = flow.sample_batch(params, z[None], context[None], jnp.zeros_like(lb), jnp.ones_like(ub))
     return lb + (ub - lb) * unit[0]
 
 
 def make_flow_sampler(sampler_dir, task, num_knots):
-    """-> (sampler(state, key, n) -> (n, num_knots, nu) knots, the flow's trained sigma_lse)
-    for GlobalMPPI(ksos_sampling="flow", ksos_flow_sampler=sampler)."""
+    """Returns sampler(state, key, n) -> knots (n, num_knots, nu), for
+    GlobalMPPI's ksos_flow_sampler, and the sigma_lse the flow was trained with."""
     flow, params, config = load_state_sampler(sampler_dir)
     lb, ub = jnp.tile(task.u_min, num_knots), jnp.tile(task.u_max, num_knots)
 

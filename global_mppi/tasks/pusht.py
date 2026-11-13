@@ -18,7 +18,7 @@ class PushT(Task):
             ROOT + "/models/pusht/scene.xml"
         )
         super().__init__(mj_model, trace_sites=["pusher"])
-        self.smoothness_weight = 2e-4  # control-change penalty, divided by dt (0.02 at dt = 10 ms)
+        self.smoothness_weight = 2e-4
 
         # Get sensor ids
         self.block_position_sensor = mujoco.mj_name2id(
@@ -75,8 +75,8 @@ class PushT(Task):
         return 50 * position_cost + 15 * orientation_cost
 
     def control_rate_cost(self, du: jax.Array) -> jax.Array:
-        """Penalize command changes between steps, including the jump from the executed
-        command; divided by dt, so a smooth plan costs the same at any planner timestep."""
+        """Penalize jerky pusher commands. Divided by dt so the weight does not
+        depend on the planner timestep."""
         return self.smoothness_weight / self.dt * jnp.sum(jnp.square(du))
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
