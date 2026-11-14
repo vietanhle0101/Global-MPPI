@@ -473,11 +473,53 @@ class GlobalMPPI(SamplingBasedController):
         """Run MPPI starting from the KSOS mean, or from the best KSOS candidate
         if that one is cheaper. If MPPI makes the plan worse, keep the start.
 
+        With one MPPI iteration, the MPPI samples around both possible starts are
+        rolled out in one batch (same noise; sample 0 is the start itself), so the
+        KSOS mean costs no extra sequential rollout. Same result as
+        `sequential_safeguarded_optimize`, one rollout pass less.
+
         Returns:
             Updated params, MPPI rollouts, cost of the final mean, and
             (candidate cost, KSOS cost, MPPI cost, used candidate, kept start)
             for printing.
         """
+        if self.iterations != 1:
+            return self.sequential_safeguarded_optimize(state, params)
+
+        best = jnp.argmin(params.cand_cost)
+        cand_cost = params.cand_cost[best]
+
+        # as in optimize: shift the knots to the current time
+        new_tk = jnp.linspace(0.0, self.plan_horizon, self.num_knots) + state.time
+        shift = lambda knots: self.interp_func(new_tk, params.tk, knots[None])[0]
+        params = params.replace(tk=new_tk)
+        starts = (shift(params.mean), shift(params.knots[best]))
+
+        # same rng for both starts -> same noise, as one MPPI step from either
+        samples = []
+        for start in starts:
+            knots, sampled = self.sample_knots(params.replace(mean=start))
+            samples.append(jnp.clip(knots, self.task.u_min, self.task.u_max))
+        rollouts = self.rollout(state, new_tk, jnp.concatenate(samples))
+        n = self.num_samples
+        ksos_cost = rollouts.costs[0].sum()  # sample 0 of the first batch is the KSOS mean
+        use_cand = cand_cost < ksos_cost
+        rollouts = jax.tree.map(lambda x: jnp.where(use_cand, x[n:], x[:n]), rollouts)
+        start = jnp.where(use_cand, starts[1], starts[0])
+        start_cost = jnp.minimum(cand_cost, ksos_cost)
+
+        params = sampled.replace(mean=start, rng=jax.random.split(sampled.rng)[0])
+        params = self.update_params(params, rollouts)
+        mppi_cost = self.rollout(state, new_tk, params.mean[None]).costs.sum()
+        keep = mppi_cost > start_cost
+        params = params.replace(mean=jnp.where(keep, start, params.mean))
+        return params, rollouts, jnp.minimum(mppi_cost, start_cost), (cand_cost, ksos_cost, mppi_cost, use_cand, keep)
+
+    def sequential_safeguarded_optimize(
+        self, state: mjx.Data, params: GlobalMPPIParams
+    ) -> Tuple[GlobalMPPIParams, Trajectory, jax.Array, Tuple[jax.Array, ...]]:
+        """`safeguarded_optimize` with three sequential rollout passes (KSOS mean,
+        MPPI samples, new mean); used for more than one MPPI iteration."""
         best = jnp.argmin(params.cand_cost)
         cand_cost = params.cand_cost[best]
         ksos_cost = self.rollout(state, params.tk, params.mean[None]).costs.sum()
