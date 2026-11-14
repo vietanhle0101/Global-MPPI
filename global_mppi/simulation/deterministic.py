@@ -213,7 +213,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         # run a full cycle twice, the second call gets the same types as in the loop
         for _ in range(2):
             policy_params = jit_ksos_rollout(mjx_data, policy_params.replace(iter=0))
-            policy_params = controller.solve_ksos(policy_params)
+            policy_params = controller.solve_ksos(policy_params, mjx_data)
             policy_params = policy_params.replace(mean=policy_params.ksos_mean)
             policy_params, *_ = jit_safeguarded_optimize(mjx_data, policy_params)
     else:
@@ -388,7 +388,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # run ksos update to initilize the mean
             if controller.ctrl_name == "globalmppi":
-                enable_auto_calib = True          # run ksos update
+                enable_auto_calib = controller.ksos_auto_calib  # GP sigma fit before each KSOS solve
                 
                 log_dir = "test/log"
                 os.makedirs(log_dir, exist_ok=True)
@@ -489,7 +489,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         # 3. Time the KSOS solve
                         # ============================================================
                         ksos_solver_start = time.perf_counter()
-                        policy_params = controller.solve_ksos(policy_params)
+                        policy_params = controller.solve_ksos(policy_params, mjx_data)
                         ksos_solver_time = time.perf_counter() - ksos_solver_start
 
                         if log_l2s:

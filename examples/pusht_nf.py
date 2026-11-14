@@ -11,6 +11,11 @@ import getpass
 if "--no-headless" not in sys.argv:
     os.environ.setdefault("MUJOCO_GL", "egl")
 
+# One BLAS/OpenMP thread: idle pool threads busy-wait on every core and slow
+# the small CPU solves (KSOS, GP calibration) by up to 100x.
+for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(var, "1")
+
 import mujoco
 import numpy as np
 
@@ -36,9 +41,15 @@ parser.add_argument(
 )
 parser.add_argument(
     "--ksos-solver",
-    choices=["newton", "newton-rs"],
+    choices=["newton", "newton-rs", "learned"],
     default="newton-rs",
-    help="KSOS solver used by GlobalMPPI (default: newton-rs)",
+    help="KSOS solver used by GlobalMPPI (default: newton-rs). 'learned' uses the trained "
+    "solver from --ksos-solver-dir with sigma = 1 and no GP calibration, as in its training",
+)
+parser.add_argument(
+    "--ksos-solver-dir",
+    default="ksos_l2o/data/sdp_solver_k2",
+    help="Output dir of ksos_l2o/train_solver.py (needed for --ksos-solver learned)",
 )
 parser.add_argument(
     "--ksos-sampling",
@@ -238,6 +249,15 @@ elif args.algorithm == "globalmppi":
         from ksos_l2o.state_flow import make_flow_sampler
 
         flow_sampler, flow_sigma = make_flow_sampler(args.ksos_flow_dir, task, 6)
+    learned_solver = None
+    if args.ksos_solver == "learned":
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from ksos_l2o.context import pusht_context
+        from ksos_l2o.sdp_solver import load_learned_solver
+
+        learned_solver = load_learned_solver(
+            args.ksos_solver_dir, np.tile(task.u_min, 6), np.tile(task.u_max, 6), pusht_context
+        )
     ctrl = GlobalMPPI(
         task,
         num_samples=args.mppi_samples,
@@ -247,11 +267,12 @@ elif args.algorithm == "globalmppi":
         plan_horizon=1.0,
         num_knots=6,
         iterations=args.mppi_iterations,
-        ksos_solver=args.ksos_solver,
+        ksos_solver="newton-rs" if args.ksos_solver == "learned" else args.ksos_solver,
         ksos_sampling=args.ksos_sampling,
         ksos_num_samples=args.ksos_num_samples,
         elite_num=args.elite_num,
         ksos_flow_sampler=flow_sampler,
+        ksos_learned_solver=learned_solver,
     )
     ctrl.ksos_num_restart = args.ksos_passes
     ctrl.ksos_warm_start = args.warm_start

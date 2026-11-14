@@ -61,6 +61,7 @@ class GlobalMPPI(SamplingBasedController):
         ksos_num_samples: int = 256,
         elite_num: int = 80,
         ksos_flow_sampler: Callable = None,
+        ksos_learned_solver: Callable = None,
     ) -> None:
         """Initialize the controller.
 
@@ -81,6 +82,9 @@ class GlobalMPPI(SamplingBasedController):
             iterations: The number of optimization iterations to perform.
             ksos_flow_sampler: (state, key, n) -> knots of shape (n, num_knots, nu).
                 Used for the first KSOS pass when ksos_sampling="flow".
+            ksos_learned_solver: (samples (n, dim), costs (n,), state) -> (z, cost),
+                e.g. ksos_l2o.sdp_solver.load_learned_solver. Replaces ksos.solve; it
+                gets all candidates (no elite filter) and a fixed sigma, as in training.
         """
         super().__init__(
             task,
@@ -116,6 +120,8 @@ class GlobalMPPI(SamplingBasedController):
         self.ksos_linesearch = True
         self.ksos_num_restart = 5
         self.ksos_solver = ksos_solver
+        self.ksos_learned_solver = ksos_learned_solver
+        self.ksos_auto_calib = ksos_learned_solver is None  # GP sigma fit before each solve
         assert ksos_sampling in KSOS_SAMPLING_MODES, f"unknown ksos_sampling: {ksos_sampling}"
         assert ksos_sampling != "flow" or ksos_flow_sampler is not None, "flow sampling needs ksos_flow_sampler"
         self.ksos_sampling = ksos_sampling
@@ -363,6 +369,7 @@ class GlobalMPPI(SamplingBasedController):
     def solve_ksos(
         self,
         params: GlobalMPPIParams,
+        state: mjx.Data = None,
     ) -> GlobalMPPIParams:
         """Fit an updated mean from the KSOS candidates rolled out in
         `ksos_rollout`. Takes the `self.elite_num` lowest-cost candidates,
@@ -370,7 +377,17 @@ class GlobalMPPI(SamplingBasedController):
         that never make progress), and hands the survivors to the KernelSOS
         solver (`ksos.solve`, using `self.ksos_solver`) to produce a new
         `ksos_mean`. Falls back to returning `params` unchanged if every
-        elite is filtered out or the solver fails."""
+        elite is filtered out or the solver fails.
+
+        With `self.ksos_learned_solver`, all candidates go to the learned solver
+        instead (it needs `state` for its context)."""
+        if self.ksos_learned_solver is not None:
+            n = params.lse_cost.shape[0]
+            z, cost = self.ksos_learned_solver(params.knots.reshape(n, -1), params.lse_cost, state)
+            return params.replace(
+                ksos_mean=jnp.asarray(z, jnp.float32).reshape(self.num_knots, self.task.model.nu),
+                ksos_result_cost=jnp.asarray(cost, jnp.float32),
+            )
 
         indices = jnp.argsort(params.lse_cost)
         elites = indices[: self.elite_num]
