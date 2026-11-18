@@ -149,6 +149,91 @@ To check an existing solver on new data without retraining, add `--eval-only`
 (keep `--newton-steps` equal to the checkpoint's). Note that this overwrites the
 `report.json` in that directory.
 
+## M20 box pushing (`m20push`)
+
+A Deep Robotics M20, a wheeled-legged quadruped, pushes a 0.6 x 0.4 x 0.4 m,
+5 kg box to a goal pose with a bumper post ahead of its front wheels. The
+robot is planar and tracks body-frame velocity commands (forward, sideways, yaw
+rate), as the real robot's stock gait takes them; only the bumper may touch
+the box.
+
+| File | What |
+| --- | --- |
+| `global_mppi/tasks/m20push.py` | `M20BoxPush` (task and cost), `PUSH_WEIGHTS`, `m20push_context`, `sample_push_state` |
+| `global_mppi/algs/steered_global_mppi.py` | `SteeredGlobalMPPI`: GlobalMPPI with the task's `steer` and `drop_glitch` in every rollout |
+| `global_mppi/models/m20push/build.py` | Planner model (MJX, 50 ms) and CPU plant (1 ms), sizes, `Plant`; MuJoCo and NumPy only |
+| `global_mppi/models/m20push/*.xml` | Snapshots of both models (`python -m global_mppi.models.m20push.build`) |
+| `global_mppi/simulation/m20push.py` | `Settings`, `make_controller`, `Loop`: closed loop against a separate plant |
+| `examples/m20push.py` | Push-phase episodes from `sample_push_state` starts |
+| `tests/test_m20push.py` | Models, states, steering, glitch guard |
+
+```bash
+PYTHONPATH=.:ksos-tools python examples/m20push.py --seeds 0,1,2
+PYTHONPATH=.:ksos-tools python examples/m20push.py --seeds 0 --video   # mp4 in logs/m20push/
+```
+
+The full task (`M20BoxPush()`, default weights) is the whole job from anywhere
+on the floor. GlobalMPPI alone did not solve it: getting round the box takes a
+multi-second detour that a sampler re-seeded every cycle doesn't commit to. The
+working setup splits the job. A motion planner puts the robot at a contact,
+GlobalMPPI pushes from there (the push phase), and short rule-based pushes
+finish within 40 cm of the goal. On the Mac that passed 9 of 10 scenarios,
+every box within 3.5 cm and 2.5 degrees. The planner and the fine pushes live
+in the deployment repo; this is the part to improve.
+
+**Push phase.** `M20BoxPush(weights=PUSH_WEIGHTS)`, controlled by
+`SteeredGlobalMPPI`:
+
+- The cost holds the bumper at the chosen contact (mocap body `contact`, set
+  with `M20BoxPush.with_contact`) and keeps the robot square to the face.
+- The third control is the robot's heading relative to the face, not its yaw
+  rate. `steer` turns that heading into a yaw rate by feedback, in the rollouts
+  and in the plant. Pushing off centre turns the box, and the face swings into
+  a front wheel unless the robot turns with it; sampling a yaw-rate profile
+  that does this rarely worked.
+
+`examples/m20push.py` runs push phases only. Each episode ends on reaching the
+goal, a wheel touching the box, losing contact for 1 s, or a time limit. On a
+Mac CPU (32 KSOS candidates, 1 pass, 512 MPPI samples, plain cost):
+
+- seeds 0-2 each ended "lost";
+- the boxes moved 3 to 36 cm closer (seed 2 got to 16 cm);
+- no wheel touched;
+- each 0.5 s replan took 0.5-1.1 s.
+
+Results go to `logs/m20push/results.json`.
+
+**Two departures from `run_interactive`.**
+
+- *Replan period and spline shift.* The loop replans every 0.5 s, not every
+  20 ms. Before planning it shifts the previous plan to now, holding the last
+  knot. The cubic's own shift extrapolates past the last knot; at 0.5 s that
+  tail ran to the command limits and into the box.
+- *Commitment.* The previous plan stays unless the new one is 3% cheaper.
+  Without this, the first command flipped between very different, equally
+  cheap plans every cycle.
+
+**MJX glitch.** At first contact MJX 3.3.2 sometimes throws the box 0.86 m in
+one 50 ms step. MuJoCo's CPU engine doesn't, from the same state. Whether MJX
+does depends on how XLA compiled the surrounding program: a 22-step rollout was
+clean, a 60-step one threw the box. It does not depend on the solver, contact
+shape, friction or margins. `M20BoxPush.drop_glitch` keeps the previous state
+for any step that moves the box or robot more than 5 cm (real motion is under
+1.5 cm a step). The planner model uses Euler steps, a sphere bumper and extra
+hinge inertia on the box, for the same reason.
+
+**For `ksos_l2o`:**
+
+- `m20push_context(qpos, qvel, contact)` (18 values) plays the part of
+  `pusht_context`.
+- `sample_push_state(key, task)` plays the part of
+  `problem.sample_initial_state`. It returns push-ready states: the box
+  0.1-1.2 m from the goal, the robot at a contact on the face that points at
+  the goal, offset to turn the box, plus jitter.
+- `state_flow.make_flow_sampler` and the dataset scripts call
+  `pusht_context` directly. They need the context function passed in before
+  they work for this task.
+
 ## Plotting results
 
 ```bash
